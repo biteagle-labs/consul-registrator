@@ -1,5 +1,7 @@
 # Consul Registrator
 
+English | [中文](README_CN.md)
+
 Lightweight Docker service registrator for Consul, written in C. Watches Docker container start/stop events and automatically registers/deregisters services with a Consul agent.
 
 Built on Alpine Linux with libcurl and cJSON. Single binary, minimal footprint.
