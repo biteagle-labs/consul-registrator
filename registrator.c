@@ -22,6 +22,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 /* -- Constants ------------------------------------------------------------ */
 
 #define MAX_PORTS              32
@@ -39,6 +44,7 @@ typedef struct {
     int  resync_interval;
     int  default_port;
     char hostname[64];
+    char host_ip[64];     /* resolved IP for Consul Address field */
 } Config;
 
 typedef struct {
@@ -52,6 +58,7 @@ typedef struct {
     char      container_name[128];
     PortEntry ports[MAX_PORTS];
     int       port_count;
+    int       host_mapped;    /* 1 = ports from HostPort mapping, use host IP */
 } ServiceDef;
 
 typedef struct {
@@ -278,7 +285,26 @@ static void extract_image_name(const char *image, char *out, size_t out_sz)
 
 static void detect_ports(cJSON *inspect, const Config *cfg, ServiceDef *svc)
 {
-    svc->port_count = 0;
+    svc->port_count  = 0;
+    svc->host_mapped = 0;
+
+    /* helper: check if any HostPort binding exists */
+    cJSON *netset    = cJSON_GetObjectItem(inspect, "NetworkSettings");
+    cJSON *ports_obj = cJSON_GetObjectItem(netset, "Ports");
+    int    has_host_port = 0;
+    if (cJSON_IsObject(ports_obj)) {
+        cJSON *entry;
+        cJSON_ArrayForEach(entry, ports_obj) {
+            if (!cJSON_IsArray(entry)) continue;
+            cJSON *binding;
+            cJSON_ArrayForEach(binding, entry) {
+                cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
+                const char *hp_str = cJSON_GetStringValue(hp);
+                if (hp_str && hp_str[0]) { has_host_port = 1; break; }
+            }
+            if (has_host_port) break;
+        }
+    }
 
     /* 1. CONSUL_SERVICE_PORT */
     const char *manual = get_config(inspect, "CONSUL_SERVICE_PORT", NULL);
@@ -287,13 +313,12 @@ static void detect_ports(cJSON *inspect, const Config *cfg, ServiceDef *svc)
         if (port > 0) {
             svc->ports[0].port = port;
             svc->port_count    = 1;
+            svc->host_mapped   = has_host_port;
         }
         return;
     }
 
     /* 2. Port mapping HostPort (deduplicate: IPv4 + IPv6 binding same port counted once) */
-    cJSON *netset    = cJSON_GetObjectItem(inspect, "NetworkSettings");
-    cJSON *ports_obj = cJSON_GetObjectItem(netset, "Ports");
     if (cJSON_IsObject(ports_obj)) {
         cJSON *entry;
         cJSON_ArrayForEach(entry, ports_obj) {
@@ -314,9 +339,12 @@ static void detect_ports(cJSON *inspect, const Config *cfg, ServiceDef *svc)
             }
         }
     }
-    if (svc->port_count > 0) return;
+    if (svc->port_count > 0) {
+        svc->host_mapped = 1;
+        return;
+    }
 
-    /* 3. EXPOSE */
+    /* 3. EXPOSE (no host mapping -- container IP) */
     cJSON *config  = cJSON_GetObjectItem(inspect, "Config");
     cJSON *exposed = cJSON_GetObjectItem(config, "ExposedPorts");
     if (cJSON_IsObject(exposed)) {
@@ -360,6 +388,110 @@ static void tags_to_json(const char *tags_str, char *out, size_t out_sz)
     snprintf(out, out_sz, "%s", json ? json : "[]");
     free(json);
     cJSON_Delete(arr);
+}
+
+/* -- Resolve host IP address ---------------------------------------------- */
+
+/*
+ * Get the host's outbound IP by creating a UDP socket "connected" to an
+ * external address (no packet is actually sent). This returns the source IP
+ * the kernel would choose for outbound traffic -- i.e. the host's primary
+ * private/internal IP, which is what we want for Consul service Address.
+ *
+ * Priority: ADVERTISE_ADDR env > getaddrinfo(hostname) > UDP connect trick
+ */
+static int get_outbound_ip(char *ip_buf, size_t ip_buf_sz)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+
+    struct sockaddr_in serv;
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET;
+    serv.sin_port   = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &serv.sin_addr);
+
+    if (connect(sock, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    struct sockaddr_in local;
+    socklen_t len = sizeof(local);
+    if (getsockname(sock, (struct sockaddr *)&local, &len) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    inet_ntop(AF_INET, &local.sin_addr, ip_buf, (socklen_t)ip_buf_sz);
+    close(sock);
+    return 0;
+}
+
+static void resolve_host_ip(Config *cfg)
+{
+    /* 1. Explicit env var override */
+    const char *adv = getenv("ADVERTISE_ADDR");
+    if (adv && adv[0]) {
+        strncpy(cfg->host_ip, adv, sizeof(cfg->host_ip) - 1);
+        return;
+    }
+
+    /* 2. Try getaddrinfo on hostname (skip if resolves to 127.x.x.x) */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(cfg->hostname, NULL, &hints, &res) == 0 && res) {
+        struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+        char tmp[64];
+        inet_ntop(AF_INET, &addr->sin_addr, tmp, sizeof(tmp));
+        freeaddrinfo(res);
+        if (strncmp(tmp, "127.", 4) != 0) {
+            strncpy(cfg->host_ip, tmp, sizeof(cfg->host_ip) - 1);
+            return;
+        }
+    } else if (res) {
+        freeaddrinfo(res);
+    }
+
+    /* 3. UDP connect trick -- get outbound IP */
+    if (get_outbound_ip(cfg->host_ip, sizeof(cfg->host_ip)) == 0)
+        return;
+
+    /* 4. Fallback to hostname (old behavior) */
+    strncpy(cfg->host_ip, cfg->hostname, sizeof(cfg->host_ip) - 1);
+}
+
+/* -- Extract container IP from inspect JSON -------------------------------- */
+
+static void get_container_ip(cJSON *inspect, char *ip_buf, size_t ip_buf_sz)
+{
+    ip_buf[0] = '\0';
+    cJSON *netset = cJSON_GetObjectItem(inspect, "NetworkSettings");
+    if (!netset) return;
+
+    /* 1. NetworkSettings.IPAddress (default bridge) */
+    cJSON      *ip_j = cJSON_GetObjectItem(netset, "IPAddress");
+    const char *ip   = cJSON_GetStringValue(ip_j);
+    if (ip && ip[0]) {
+        strncpy(ip_buf, ip, ip_buf_sz - 1);
+        return;
+    }
+
+    /* 2. NetworkSettings.Networks.<name>.IPAddress (custom networks) */
+    cJSON *networks = cJSON_GetObjectItem(netset, "Networks");
+    if (cJSON_IsObject(networks)) {
+        cJSON *net;
+        cJSON_ArrayForEach(net, networks) {
+            cJSON      *net_ip_j = cJSON_GetObjectItem(net, "IPAddress");
+            const char *net_ip   = cJSON_GetStringValue(net_ip_j);
+            if (net_ip && net_ip[0]) {
+                strncpy(ip_buf, net_ip, ip_buf_sz - 1);
+                return;
+            }
+        }
+    }
 }
 
 /* -- Register a single container ------------------------------------------ */
@@ -410,6 +542,23 @@ static void register_container(const char *container_id, const Config *cfg)
     strncpy(svc.container_name, container_name, sizeof(svc.container_name) - 1);
     detect_ports(inspect, cfg, &svc);
 
+    /* Determine service address:
+     * - HostPort mapping → host IP (service accessible via host)
+     * - EXPOSE / default → container IP (service only on container network)
+     * - host network mode → container IP is empty, fallback to host IP
+     */
+    char container_ip[64] = "";
+    get_container_ip(inspect, container_ip, sizeof(container_ip));
+
+    const char *address;
+    if (svc.host_mapped) {
+        address = cfg->host_ip;
+    } else if (container_ip[0]) {
+        address = container_ip;
+    } else {
+        address = cfg->host_ip;  /* host network mode: no container IP */
+    }
+
     for (int i = 0; i < svc.port_count; i++) {
         int port = svc.ports[i].port;
 
@@ -434,7 +583,7 @@ static void register_container(const char *container_id, const Config *cfg)
 
         cJSON_AddStringToObject(reg, "ID",      service_id);
         cJSON_AddStringToObject(reg, "Name",    port_name);
-        cJSON_AddStringToObject(reg, "Address", cfg->hostname);
+        cJSON_AddStringToObject(reg, "Address", address);
         cJSON_AddNumberToObject(reg, "Port",    (double)port);
         cJSON_AddItemToObject(reg, "Tags", tags_arr ? tags_arr : cJSON_CreateArray());
 
@@ -454,7 +603,8 @@ static void register_container(const char *container_id, const Config *cfg)
         int ok = (rc == 0 && (!resp || resp[0] == '\0' ||
                                strcmp(resp, "null") == 0));
         if (ok)
-            log_info("Registered service: %s (%s) port=%d", port_name, service_id, port);
+            log_info("Registered service: %s (%s) addr=%s port=%d",
+                     port_name, service_id, address, port);
         else
             log_error("Registration failed: %s (%s): %s",
                       port_name, service_id, resp ? resp : "curl error");
@@ -849,6 +999,8 @@ int main(void)
     v = getenv("HOSTNAME_OVERRIDE");
     if (v) strncpy(cfg.hostname, v, sizeof(cfg.hostname) - 1);
 
+    resolve_host_ip(&cfg);
+
     v = getenv("LOG_LEVEL");
     if (v && (strcmp(v, "debug") == 0 || strcmp(v, "DEBUG") == 0))
         g_log_debug = 1;
@@ -866,6 +1018,7 @@ int main(void)
     log_info("Resync:   every %ds", cfg.resync_interval);
     log_info("Default:  port %d", cfg.default_port);
     log_info("Hostname: %s", cfg.hostname);
+    log_info("Host IP:  %s", cfg.host_ip);
     log_info("Mode:     opt-in (CONSUL_LISTEN_ENABLE=true)");
     log_info("=========================================");
 

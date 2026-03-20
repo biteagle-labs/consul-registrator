@@ -11,6 +11,7 @@
 - **Opt-in 模式** — 仅设置了 `CONSUL_LISTEN_ENABLE=true` 的容器才会被注册
 - **双通道配置** — 优先读取容器环境变量，其次读取 labels
 - **自动端口检测** — `CONSUL_SERVICE_PORT` > HostPort 端口映射 > EXPOSE > 默认 8080
+- **智能地址解析** — 有端口映射的容器使用宿主机 IP，bridge/自定义网络容器使用容器 IP
 - **按端口配置服务** — 通过 `CONSUL_SERVICE_<port>_NAME` 为每个容器注册多个服务
 - **定时全量同步** — 按间隔全量同步，捕获遗漏事件并清理孤立服务
 - **三线程架构** — 事件流 + 事件处理器 + 全量同步，互不阻塞
@@ -33,6 +34,7 @@ services:
       - CONSUL_ADDR=${CONSUL_ADDR:-http://localhost:8500}
       - RESYNC_INTERVAL=${RESYNC_INTERVAL:-30}
       - DEFAULT_PORT=${DEFAULT_PORT:-8080}
+      - ADVERTISE_ADDR=${ADVERTISE_ADDR:-}
     logging:
       driver: json-file
       options:
@@ -106,6 +108,18 @@ docker run -d -p 8080:80 \
 3. Dockerfile 中的 `EXPOSE` 指令
 4. 默认端口（8080）
 
+### 地址解析
+
+注册到 Consul 的服务地址自动确定：
+
+| 场景 | 地址 |
+|------|------|
+| 有端口映射的容器（`-p`） | 宿主机 IP（自动检测或 `ADVERTISE_ADDR`） |
+| bridge/自定义网络容器（无端口映射） | 容器 IP |
+| `network_mode: host` 的容器 | 宿主机 IP |
+
+宿主机 IP 检测优先级：`ADVERTISE_ADDR` 环境变量 > `getaddrinfo(hostname)` > UDP 探测出口 IP。
+
 ## Registrator 自身配置
 
 Registrator 容器的环境变量：
@@ -116,6 +130,7 @@ Registrator 容器的环境变量：
 | `CONSUL_ADDR` | Consul HTTP 地址 | `http://localhost:8500` |
 | `RESYNC_INTERVAL` | 全量同步间隔（秒） | `30` |
 | `DEFAULT_PORT` | 无法检测端口时的默认值 | `8080` |
+| `ADVERTISE_ADDR` | 覆盖自动检测的宿主机 IP | 自动检测 |
 
 ## 架构
 

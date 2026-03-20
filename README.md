@@ -11,6 +11,7 @@ Built on Alpine Linux with libcurl and cJSON. Single binary, minimal footprint.
 - **Opt-in mode** — only containers with `CONSUL_LISTEN_ENABLE=true` are registered
 - **Dual-channel config** — reads from container environment variables first, then labels
 - **Auto port detection** — `CONSUL_SERVICE_PORT` > HostPort mapping > EXPOSE > default 8080
+- **Smart address resolution** — uses host IP for port-mapped containers, container IP for bridge/custom networks
 - **Per-port service config** — register multiple services per container with `CONSUL_SERVICE_<port>_NAME`
 - **Periodic resync** — full sync on interval to catch missed events and clean orphans
 - **Three-thread architecture** — event stream + event processor + resync, no blocking
@@ -33,6 +34,7 @@ services:
       - CONSUL_ADDR=${CONSUL_ADDR:-http://localhost:8500}
       - RESYNC_INTERVAL=${RESYNC_INTERVAL:-30}
       - DEFAULT_PORT=${DEFAULT_PORT:-8080}
+      - ADVERTISE_ADDR=${ADVERTISE_ADDR:-}
     logging:
       driver: json-file
       options:
@@ -106,6 +108,18 @@ Set via container environment variables (`-e`) or labels (`-l`). Environment var
 3. `EXPOSE` directive from Dockerfile
 4. Default port (8080)
 
+### Address Resolution
+
+The service address registered in Consul is determined automatically:
+
+| Scenario | Address |
+|----------|---------|
+| Container with port mapping (`-p`) | Host IP (auto-detected or `ADVERTISE_ADDR`) |
+| Container on bridge/custom network (no port mapping) | Container IP |
+| Container with `network_mode: host` | Host IP |
+
+Host IP detection priority: `ADVERTISE_ADDR` env > `getaddrinfo(hostname)` > outbound IP via UDP probe.
+
 ## Registrator Configuration
 
 Environment variables for the registrator container itself:
@@ -116,6 +130,7 @@ Environment variables for the registrator container itself:
 | `CONSUL_ADDR` | Consul HTTP address | `http://localhost:8500` |
 | `RESYNC_INTERVAL` | Full sync interval in seconds | `30` |
 | `DEFAULT_PORT` | Fallback port when none detected | `8080` |
+| `ADVERTISE_ADDR` | Override auto-detected host IP for Consul registration | Auto-detect |
 
 ## Architecture
 
