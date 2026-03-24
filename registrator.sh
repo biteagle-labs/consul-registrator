@@ -14,17 +14,48 @@ CONSUL_ADDR="${CONSUL_ADDR:-http://localhost:8500}"
 CONSUL_TOKEN="${REGISTRATOR_TOKEN:-}"
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
 RESYNC_INTERVAL="${RESYNC_INTERVAL:-30}"
-DEFAULT_PORT="${DEFAULT_PORT:-8080}"
 HOSTNAME_OVERRIDE="${HOSTNAME_OVERRIDE:-$(hostname)}"
+LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # --- Global state ---
 RESYNC_PID=""
 WATCH_PID=""
+HOST_IP=""
 
 # --- Logging ---
-log_info()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO]  $*"; }
-log_warn()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN]  $*"; }
+log_info()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO ] $*"; }
+log_warn()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN ] $*"; }
 log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2; }
+log_debug() {
+    case "$LOG_LEVEL" in
+        debug|DEBUG) echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] $*" ;;
+    esac
+}
+
+# --- Service state tracking (change-only logging) ---
+TRACKED_SERVICES=""
+
+track_is_new() {
+    local service_id="$1"
+    case " $TRACKED_SERVICES " in
+        *" $service_id "*) return 1 ;;  # already tracked
+        *) return 0 ;;                  # new
+    esac
+}
+
+track_register() {
+    local service_id="$1"
+    if track_is_new "$service_id"; then
+        TRACKED_SERVICES="$TRACKED_SERVICES $service_id"
+        return 0  # is new
+    fi
+    return 1  # already tracked
+}
+
+track_deregister() {
+    local service_id="$1"
+    TRACKED_SERVICES=$(echo "$TRACKED_SERVICES" | sed "s| $service_id | |g; s|^ ||; s| $||")
+}
 
 # --- Docker API ---
 docker_api() {
@@ -54,6 +85,41 @@ consul_get() {
     else
         curl -s "${CONSUL_ADDR}${endpoint}"
     fi
+}
+
+# --- Resolve host IP address ---
+# Priority: ADVERTISE_ADDR > getent hostname > outbound IP via UDP trick
+resolve_host_ip() {
+    # 1. Explicit env var override
+    if [ -n "${ADVERTISE_ADDR:-}" ]; then
+        HOST_IP="$ADVERTISE_ADDR"
+        return
+    fi
+
+    # 2. Try resolving hostname (skip 127.x.x.x)
+    local resolved
+    resolved=$(getent ahostsv4 "$(hostname)" 2>/dev/null | awk 'NR==1{print $1}')
+    if [ -n "$resolved" ] && ! echo "$resolved" | grep -q '^127\.'; then
+        HOST_IP="$resolved"
+        return
+    fi
+
+    # 3. UDP connect trick -- get outbound IP (no packet sent)
+    local outbound
+    outbound=$(python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(('8.8.8.8', 53))
+print(s.getsockname()[0])
+s.close()
+" 2>/dev/null || true)
+    if [ -n "$outbound" ] && [ "$outbound" != "0.0.0.0" ]; then
+        HOST_IP="$outbound"
+        return
+    fi
+
+    # 4. Fallback to hostname
+    HOST_IP="$HOSTNAME_OVERRIDE"
 }
 
 # --- Get config value from container ---
@@ -98,47 +164,87 @@ get_container_name() {
     echo "$inspect_json" | jq -r '.Name' | sed 's|^/||'
 }
 
+# --- Get container IP ---
+get_container_ip() {
+    local inspect_json="$1"
+
+    # 1. NetworkSettings.IPAddress (default bridge)
+    local ip
+    ip=$(echo "$inspect_json" | jq -r '.NetworkSettings.IPAddress // empty' 2>/dev/null)
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return
+    fi
+
+    # 2. NetworkSettings.Networks.<name>.IPAddress (custom networks)
+    ip=$(echo "$inspect_json" | jq -r '[.NetworkSettings.Networks // {} | to_entries[] | .value.IPAddress // empty | select(. != "")] | first // empty' 2>/dev/null)
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return
+    fi
+}
+
 # --- Detect ports ---
-# Priority: CONSUL_SERVICE_PORT > HostPort mapping > EXPOSE > 8080
+# Priority: CONSUL_SERVICE_PORT > HostPort mapping > EXPOSE
+# Returns JSON array: [{"host_port": N, "container_port": N, "host_mapped": bool}, ...]
 detect_ports() {
     local inspect_json="$1"
 
-    # 1. Manual port override
+    # 1. Manual port override (CONSUL_SERVICE_PORT = internal/container port)
     local manual_port
     manual_port=$(get_container_config "$inspect_json" "CONSUL_SERVICE_PORT" "")
     if [ -n "$manual_port" ]; then
-        echo "$manual_port"
+        # Look up corresponding HostPort for this internal port
+        local host_port host_mapped
+        host_port=$(echo "$inspect_json" | jq -r --arg cp "$manual_port" '
+            .NetworkSettings.Ports // {} | to_entries[] |
+            select(.key | startswith($cp + "/")) |
+            .value // [] | .[] |
+            select(.HostPort != null and .HostPort != "") |
+            .HostPort' 2>/dev/null | head -1)
+
+        if [ -n "$host_port" ]; then
+            echo "[{\"host_port\":$host_port,\"container_port\":$manual_port,\"host_mapped\":true}]"
+        else
+            echo "[{\"host_port\":$manual_port,\"container_port\":$manual_port,\"host_mapped\":false}]"
+        fi
         return
     fi
 
-    # 2. Port mappings (HostPort)
-    local mapped_ports
-    mapped_ports=$(echo "$inspect_json" | jq -r '
+    # 2. Port mappings (HostPort) -- deduplicate
+    local mapped
+    mapped=$(echo "$inspect_json" | jq '
         [.NetworkSettings.Ports // {} | to_entries[] |
          select(.value != null) |
-         .value[] | select(.HostPort != null and .HostPort != "") |
-         .HostPort] | unique | .[]' 2>/dev/null)
+         {container_port: (.key | split("/")[0] | tonumber),
+          bindings: [.value[] | select(.HostPort != null and .HostPort != "") | .HostPort | tonumber]} |
+         select(.bindings | length > 0) |
+         .bindings[] as $hp |
+         {host_port: $hp, container_port: .container_port, host_mapped: true}
+        ] | unique_by(.host_port)' 2>/dev/null)
 
-    if [ -n "$mapped_ports" ]; then
-        echo "$mapped_ports"
+    if [ -n "$mapped" ] && [ "$mapped" != "[]" ]; then
+        echo "$mapped"
         return
     fi
 
-    # 3. EXPOSE ports
-    local exposed_ports
-    exposed_ports=$(echo "$inspect_json" | jq -r '
-        [.Config.ExposedPorts // {} | keys[] | split("/")[0]] | unique | .[]' 2>/dev/null)
+    # 3. EXPOSE ports (no host mapping -- container IP)
+    local exposed
+    exposed=$(echo "$inspect_json" | jq '
+        [.Config.ExposedPorts // {} | keys[] | split("/")[0] | tonumber] | unique |
+        [.[] | {host_port: ., container_port: ., host_mapped: false}]' 2>/dev/null)
 
-    if [ -n "$exposed_ports" ]; then
-        echo "$exposed_ports"
+    if [ -n "$exposed" ] && [ "$exposed" != "[]" ]; then
+        echo "$exposed"
         return
     fi
 
-    # 4. Default
-    echo "$DEFAULT_PORT"
+    # 4. No port detected
+    echo "[]"
 }
 
 # --- Register a single container ---
+# Returns exit code 0 if container was enabled (CONSUL_LISTEN_ENABLE=true)
 register_container() {
     local container_id="$1"
 
@@ -155,7 +261,7 @@ register_container() {
     local enabled
     enabled=$(get_container_config "$inspect_json" "CONSUL_LISTEN_ENABLE" "false")
     if [ "$enabled" != "true" ]; then
-        return 0
+        return 1
     fi
 
     local container_name
@@ -179,40 +285,105 @@ register_container() {
         service_tags=$(echo "$service_tags_str" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
     fi
 
-    # Get port list
-    local ports
-    ports=$(detect_ports "$inspect_json")
+    # Get port list (JSON array)
+    local ports_json
+    ports_json=$(detect_ports "$inspect_json")
 
-    if [ -z "$ports" ]; then
-        ports="$DEFAULT_PORT"
+    local port_count
+    port_count=$(echo "$ports_json" | jq 'length')
+
+    # Skip registration if no port was detected
+    if [ "$port_count" -eq 0 ]; then
+        log_debug "Skipping $container_name ($container_id): no port detected, service not registered"
+        return 0  # still enabled, just no port
+    fi
+
+    # Get container IP and detect host network mode
+    local container_ip
+    container_ip=$(get_container_ip "$inspect_json")
+    local is_host_network=false
+    if [ -z "$container_ip" ]; then
+        is_host_network=true
+    fi
+
+    # Global check interval and POD_IP
+    local check_interval
+    check_interval=$(get_container_config "$inspect_json" "CONSUL_SERVICE_CHECK_INTERVAL" "10s")
+    local global_pod_ip
+    global_pod_ip=$(get_container_config "$inspect_json" "CONSUL_SERVICE_POD_IP" "false")
+
+    if [ "$is_host_network" = "true" ] && [ "$global_pod_ip" = "true" ]; then
+        log_debug "POD_IP ignored for $container_name: container is in host network mode"
     fi
 
     # Register a service for each port
-    echo "$ports" | while IFS= read -r port; do
-        [ -z "$port" ] && continue
+    local i=0
+    while [ "$i" -lt "$port_count" ]; do
+        local port cport host_mapped
+        port=$(echo "$ports_json" | jq -r ".[$i].host_port")
+        cport=$(echo "$ports_json" | jq -r ".[$i].container_port")
+        host_mapped=$(echo "$ports_json" | jq -r ".[$i].host_mapped")
 
-        # Check for port-specific config overrides
+        # Per-port config overrides (keys always refer to internal port)
         local port_name
-        port_name=$(get_container_config "$inspect_json" "CONSUL_SERVICE_${port}_NAME" "$service_name")
+        port_name=$(get_container_config "$inspect_json" "CONSUL_SERVICE_${cport}_NAME" "$service_name")
 
         local port_tags_str
-        port_tags_str=$(get_container_config "$inspect_json" "CONSUL_SERVICE_${port}_TAGS" "")
+        port_tags_str=$(get_container_config "$inspect_json" "CONSUL_SERVICE_${cport}_TAGS" "")
         local port_tags="$service_tags"
         if [ -n "$port_tags_str" ]; then
             port_tags=$(echo "$port_tags_str" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
         fi
 
-        local service_id="${HOSTNAME_OVERRIDE}:${container_name}:${port}"
+        # POD_IP: per-port > global
+        local port_pod_ip use_pod_ip
+        port_pod_ip=$(get_container_config "$inspect_json" "CONSUL_SERVICE_${cport}_POD_IP" "")
+        use_pod_ip="$global_pod_ip"
+        if [ -n "$port_pod_ip" ]; then
+            use_pod_ip="$port_pod_ip"
+        fi
+
+        # Address/port resolution priority:
+        # 1. host network mode → always host IP, POD_IP meaningless
+        # 2. POD_IP=true (force) → container IP + internal port
+        # 3. port mapped → host IP + host port
+        # 4. EXPOSE only → container IP + container port
+        local svc_addr reg_port
+        if [ "$is_host_network" = "true" ]; then
+            svc_addr="$HOST_IP"
+            reg_port="$cport"
+        elif [ "$use_pod_ip" = "true" ]; then
+            svc_addr="$container_ip"
+            reg_port="$cport"
+        elif [ "$host_mapped" = "true" ]; then
+            svc_addr="$HOST_IP"
+            reg_port="$port"
+        else
+            svc_addr="$container_ip"
+            reg_port="$cport"
+        fi
+
+        local service_id="${HOSTNAME_OVERRIDE}:${container_name}:${reg_port}"
+
+        # TCP health check target
+        local tcp_target
+        if [ -n "$container_ip" ]; then
+            tcp_target="${container_ip}:${cport}"
+        else
+            tcp_target="${svc_addr}:${reg_port}"
+        fi
 
         local register_json
         register_json=$(jq -n \
             --arg id "$service_id" \
             --arg name "$port_name" \
-            --arg addr "$HOSTNAME_OVERRIDE" \
-            --argjson port "$port" \
+            --arg addr "$svc_addr" \
+            --argjson port "$reg_port" \
             --argjson tags "$port_tags" \
             --arg container_id "$container_id" \
             --arg container_name "$container_name" \
+            --arg tcp_target "$tcp_target" \
+            --arg check_interval "$check_interval" \
             '{
                 ID: $id,
                 Name: $name,
@@ -223,18 +394,29 @@ register_container() {
                     container_id: $container_id,
                     container_name: $container_name,
                     registrator: "self-hosted"
+                },
+                Check: {
+                    TCP: $tcp_target,
+                    Interval: $check_interval,
+                    Timeout: "5s"
                 }
             }')
 
         local result
         result=$(consul_put "/v1/agent/service/register" "$register_json")
 
-        if [ -z "$result" ]; then
-            log_info "Registered service: $port_name ($service_id) port=$port"
+        if [ -z "$result" ] || [ "$result" = "null" ]; then
+            if track_register "$service_id"; then
+                log_info "Registered service: $port_name ($service_id) addr=$svc_addr port=$reg_port check=tcp/$check_interval"
+            fi
         else
             log_error "Registration failed: $port_name ($service_id): $result"
         fi
+
+        i=$((i + 1))
     done
+
+    return 0
 }
 
 # --- Deregister all services for a container ---
@@ -270,6 +452,7 @@ deregister_container() {
         local result
         result=$(consul_put "/v1/agent/service/deregister/$sid")
         if [ -z "$result" ]; then
+            track_deregister "$sid"
             log_info "Deregistered service: $sid"
         else
             log_error "Deregistration failed: $sid: $result"
@@ -279,7 +462,7 @@ deregister_container() {
 
 # --- Full sync ---
 sync_all() {
-    log_info "Starting full sync..."
+    log_debug "Starting full sync..."
 
     # Get all running containers
     local containers
@@ -297,14 +480,8 @@ sync_all() {
     container_ids=$(echo "$containers" | jq -r '.[].Id')
 
     for cid in $container_ids; do
-        register_container "$cid"
-
-        # Check if this container has registration enabled
-        local inspect_json
-        inspect_json=$(docker_api "/containers/$cid/json")
-        local enabled
-        enabled=$(get_container_config "$inspect_json" "CONSUL_LISTEN_ENABLE" "false")
-        if [ "$enabled" = "true" ]; then
+        # register_container returns 0 if CONSUL_LISTEN_ENABLE=true
+        if register_container "$cid"; then
             registered_container_ids="$registered_container_ids $cid"
         fi
     done
@@ -312,7 +489,7 @@ sync_all() {
     # Clean up orphaned services (registered by us but container no longer exists)
     cleanup_orphans "$registered_container_ids"
 
-    log_info "Full sync completed"
+    log_debug "Full sync completed"
 }
 
 # --- Clean up orphaned services ---
@@ -342,6 +519,7 @@ cleanup_orphans() {
 
         # Check if the container is still running
         if ! echo "$valid_container_ids" | grep -q "$cid"; then
+            track_deregister "$sid"
             log_info "Cleaning orphaned service: $sid (container $cid no longer exists)"
             consul_put "/v1/agent/service/deregister/$sid"
         fi
@@ -382,7 +560,7 @@ watch_events() {
                 register_container "$container_id"
                 ;;
             stop|die)
-                log_info "Container stopped: $container_name ($container_id)"
+                log_info "Container stopped [$event_action]: $container_name ($container_id)"
                 deregister_container "$container_id" "$container_name"
                 ;;
         esac
@@ -443,13 +621,15 @@ preflight_check() {
 
 # --- Main ---
 main() {
+    resolve_host_ip
+
     log_info "========================================="
-    log_info "Consul Registrator starting"
+    log_info "Consul Registrator (shell) starting"
     log_info "Consul:   $CONSUL_ADDR"
     log_info "Docker:   $DOCKER_SOCK"
     log_info "Resync:   every ${RESYNC_INTERVAL}s"
-    log_info "Default:  port $DEFAULT_PORT"
     log_info "Hostname: $HOSTNAME_OVERRIDE"
+    log_info "Host IP:  $HOST_IP"
     log_info "Mode:     opt-in (CONSUL_LISTEN_ENABLE=true)"
     log_info "========================================="
 
