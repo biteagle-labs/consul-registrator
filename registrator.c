@@ -33,7 +33,6 @@
 #define DEFAULT_CONSUL_ADDR    "http://localhost:8500"
 #define DEFAULT_DOCKER_SOCK    "/var/run/docker.sock"
 #define DEFAULT_RESYNC_INTERVAL 30
-#define DEFAULT_PORT_NUM       8080
 
 /* -- Types ---------------------------------------------------------------- */
 
@@ -42,15 +41,13 @@ typedef struct {
     char consul_token[256];
     char docker_sock[256];
     int  resync_interval;
-    int  default_port;
     char hostname[64];
     char host_ip[64];     /* resolved IP for Consul Address field */
 } Config;
 
 typedef struct {
-    int  port;
-    char name[128];
-    char tags[512];   /* comma-separated */
+    int  host_port;       /* port for Consul registration (external access) */
+    int  container_port;  /* internal container port (for label/env key lookup) */
 } PortEntry;
 
 typedef struct {
@@ -77,7 +74,6 @@ typedef struct QEvent {
 
 typedef struct {
     Buffer  buf;
-    Config *cfg;
 } EventCtx;
 
 /* -- Globals -------------------------------------------------------------- */
@@ -90,6 +86,12 @@ static QEvent          *g_eq_head  = NULL;
 static QEvent          *g_eq_tail  = NULL;
 static pthread_mutex_t  g_eq_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   g_eq_cond  = PTHREAD_COND_INITIALIZER;
+
+/* Service state tracking (for change-only logging) */
+#define MAX_TRACKED        512
+static char             g_tracked[MAX_TRACKED][256];
+static int              g_tracked_count = 0;
+static pthread_mutex_t  g_tracked_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* -- Dynamic buffer ------------------------------------------------------- */
 
@@ -130,7 +132,8 @@ static int g_log_debug = 0;   /* 1 = enable DEBUG output, set by LOG_LEVEL=debug
 static void log_msg(const char *level, const char *fmt, ...)
 {
     time_t     t  = time(NULL);
-    struct tm *tm = localtime(&t);
+    struct tm  tm_buf;
+    struct tm *tm = localtime_r(&t, &tm_buf);
     char       ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
     printf("[%s] [%s] ", ts, level);
@@ -281,39 +284,54 @@ static void extract_image_name(const char *image, char *out, size_t out_sz)
     out[len] = '\0';
 }
 
-/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > EXPOSE > default ---- */
+/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > EXPOSE -------------- */
 
-static void detect_ports(cJSON *inspect, const Config *cfg, ServiceDef *svc)
+static void detect_ports(cJSON *inspect, ServiceDef *svc)
 {
     svc->port_count  = 0;
     svc->host_mapped = 0;
 
-    /* helper: check if any HostPort binding exists */
+    /* helper: port mappings object from NetworkSettings */
     cJSON *netset    = cJSON_GetObjectItem(inspect, "NetworkSettings");
     cJSON *ports_obj = cJSON_GetObjectItem(netset, "Ports");
-    int    has_host_port = 0;
-    if (cJSON_IsObject(ports_obj)) {
-        cJSON *entry;
-        cJSON_ArrayForEach(entry, ports_obj) {
-            if (!cJSON_IsArray(entry)) continue;
-            cJSON *binding;
-            cJSON_ArrayForEach(binding, entry) {
-                cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
-                const char *hp_str = cJSON_GetStringValue(hp);
-                if (hp_str && hp_str[0]) { has_host_port = 1; break; }
-            }
-            if (has_host_port) break;
-        }
-    }
 
-    /* 1. CONSUL_SERVICE_PORT */
+    /* 1. CONSUL_SERVICE_PORT (always refers to internal/container port) */
     const char *manual = get_config(inspect, "CONSUL_SERVICE_PORT", NULL);
     if (manual && manual[0]) {
-        int port = atoi(manual);
-        if (port > 0) {
-            svc->ports[0].port = port;
-            svc->port_count    = 1;
-            svc->host_mapped   = has_host_port;
+        int internal_port = atoi(manual);
+        if (internal_port > 0) {
+            int host_port     = internal_port;   /* default: same as internal */
+            int found_mapping = 0;
+
+            /* look up corresponding HostPort for this internal port */
+            if (cJSON_IsObject(ports_obj)) {
+                cJSON *entry;
+                cJSON_ArrayForEach(entry, ports_obj) {
+                    if (!entry->string) continue;
+                    int cp = atoi(entry->string);    /* e.g. "3000/tcp" -> 3000 */
+                    if (cp == internal_port && cJSON_IsArray(entry)) {
+                        cJSON *binding;
+                        cJSON_ArrayForEach(binding, entry) {
+                            cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
+                            const char *hp_str = cJSON_GetStringValue(hp);
+                            if (hp_str && hp_str[0]) {
+                                int hp_val = atoi(hp_str);
+                                if (hp_val > 0) {
+                                    host_port     = hp_val;
+                                    found_mapping = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            svc->ports[0].host_port      = host_port;
+            svc->ports[0].container_port = internal_port;
+            svc->port_count              = 1;
+            svc->host_mapped             = found_mapping;
         }
         return;
     }
@@ -323,19 +341,24 @@ static void detect_ports(cJSON *inspect, const Config *cfg, ServiceDef *svc)
         cJSON *entry;
         cJSON_ArrayForEach(entry, ports_obj) {
             if (!cJSON_IsArray(entry)) continue;
+            int container_port = entry->string ? atoi(entry->string) : 0;
             cJSON *binding;
             cJSON_ArrayForEach(binding, entry) {
                 cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
                 const char *hp_str = cJSON_GetStringValue(hp);
                 if (!hp_str || !hp_str[0]) continue;
-                int port = atoi(hp_str);
-                if (port <= 0 || svc->port_count >= MAX_PORTS) continue;
-                /* check for duplicates */
+                int host_port = atoi(hp_str);
+                if (host_port <= 0 || svc->port_count >= MAX_PORTS) continue;
+                /* check for duplicates by host port */
                 int dup = 0;
                 for (int k = 0; k < svc->port_count; k++) {
-                    if (svc->ports[k].port == port) { dup = 1; break; }
+                    if (svc->ports[k].host_port == host_port) { dup = 1; break; }
                 }
-                if (!dup) svc->ports[svc->port_count++].port = port;
+                if (!dup) {
+                    svc->ports[svc->port_count].host_port      = host_port;
+                    svc->ports[svc->port_count].container_port = container_port > 0 ? container_port : host_port;
+                    svc->port_count++;
+                }
             }
         }
     }
@@ -352,15 +375,20 @@ static void detect_ports(cJSON *inspect, const Config *cfg, ServiceDef *svc)
         cJSON_ArrayForEach(ep, exposed) {
             if (ep->string && svc->port_count < MAX_PORTS) {
                 int port = atoi(ep->string);
-                if (port > 0) svc->ports[svc->port_count++].port = port;
+                if (port > 0) {
+                    svc->ports[svc->port_count].host_port      = port;
+                    svc->ports[svc->port_count].container_port = port;
+                    svc->port_count++;
+                }
             }
         }
     }
     if (svc->port_count > 0) return;
 
-    /* 4. Default */
-    svc->ports[0].port = cfg->default_port;
-    svc->port_count    = 1;
+    /* 4. No port detected -- leave port_count = 0.
+     * Services without any port (no CONSUL_SERVICE_PORT, no HostPort mapping,
+     * no EXPOSE) should not be registered with Consul, as a fabricated default
+     * port would create a health check that always fails. */
 }
 
 /* -- Comma-separated tags -> JSON array string ---------------------------- */
@@ -376,13 +404,14 @@ static void tags_to_json(const char *tags_str, char *out, size_t out_sz)
     strncpy(tmp, tags_str, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
-    char *tok = strtok(tmp, ",");
+    char *saveptr = NULL;
+    char *tok = strtok_r(tmp, ",", &saveptr);
     while (tok) {
         while (*tok == ' ') tok++;
         char *end = tok + strlen(tok) - 1;
         while (end > tok && *end == ' ') *end-- = '\0';
         if (*tok) cJSON_AddItemToArray(arr, cJSON_CreateString(tok));
-        tok = strtok(NULL, ",");
+        tok = strtok_r(NULL, ",", &saveptr);
     }
     char *json = cJSON_PrintUnformatted(arr);
     snprintf(out, out_sz, "%s", json ? json : "[]");
@@ -494,9 +523,44 @@ static void get_container_ip(cJSON *inspect, char *ip_buf, size_t ip_buf_sz)
     }
 }
 
+/* -- Service state tracking (change-only logging) ------------------------- */
+
+/* Returns 1 if service_id is newly registered (state change), 0 if already tracked */
+static int track_register(const char *service_id)
+{
+    int is_new = 1;
+    pthread_mutex_lock(&g_tracked_mutex);
+    for (int i = 0; i < g_tracked_count; i++) {
+        if (strcmp(g_tracked[i], service_id) == 0) { is_new = 0; break; }
+    }
+    if (is_new && g_tracked_count < MAX_TRACKED) {
+        strncpy(g_tracked[g_tracked_count], service_id, 255);
+        g_tracked[g_tracked_count][255] = '\0';
+        g_tracked_count++;
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+    return is_new;
+}
+
+/* Remove service_id from tracked set */
+static void track_deregister(const char *service_id)
+{
+    pthread_mutex_lock(&g_tracked_mutex);
+    for (int i = 0; i < g_tracked_count; i++) {
+        if (strcmp(g_tracked[i], service_id) == 0) {
+            if (i < g_tracked_count - 1)
+                memcpy(g_tracked[i], g_tracked[g_tracked_count - 1], 256);
+            g_tracked_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+}
+
 /* -- Register a single container ------------------------------------------ */
 
-static void register_container(const char *container_id, const Config *cfg)
+/* Returns: 1 = container had CONSUL_LISTEN_ENABLE=true, 0 = not enabled / error */
+static int register_container(const char *container_id, const Config *cfg)
 {
     char  path[256];
     char *body = NULL;
@@ -505,18 +569,18 @@ static void register_container(const char *container_id, const Config *cfg)
     if (docker_request(cfg, path, &body) != 0 || !body) {
         log_warn("Failed to inspect container: %.12s", container_id);
         free(body);
-        return;
+        return 0;
     }
 
     cJSON *inspect = cJSON_Parse(body);
     free(body);
-    if (!inspect) return;
+    if (!inspect) return 0;
 
     /* opt-in check */
     const char *enabled = get_config(inspect, "CONSUL_LISTEN_ENABLE", "false");
     if (strcmp(enabled, "true") != 0) {
         cJSON_Delete(inspect);
-        return;
+        return 0;
     }
 
     /* container name */
@@ -540,41 +604,78 @@ static void register_container(const char *container_id, const Config *cfg)
     memset(&svc, 0, sizeof(svc));
     strncpy(svc.container_id,   container_id,   sizeof(svc.container_id) - 1);
     strncpy(svc.container_name, container_name, sizeof(svc.container_name) - 1);
-    detect_ports(inspect, cfg, &svc);
+    detect_ports(inspect, &svc);
 
-    /* Determine service address:
-     * - HostPort mapping → host IP (service accessible via host)
-     * - EXPOSE / default → container IP (service only on container network)
-     * - host network mode → container IP is empty, fallback to host IP
-     */
-    char container_ip[64] = "";
-    get_container_ip(inspect, container_ip, sizeof(container_ip));
-
-    const char *address;
-    if (svc.host_mapped) {
-        address = cfg->host_ip;
-    } else if (container_ip[0]) {
-        address = container_ip;
-    } else {
-        address = cfg->host_ip;  /* host network mode: no container IP */
+    /* Skip registration if no port was detected -- the container does not
+     * expose any port (no CONSUL_SERVICE_PORT, no HostPort, no EXPOSE).
+     * Registering it would create a health check on a fabricated port. */
+    if (svc.port_count == 0) {
+        log_debug("Skipping %s (%.12s): no port detected, service not registered",
+                  container_name, container_id);
+        cJSON_Delete(inspect);
+        return 1;  /* enabled but no port -- still counts as enabled for orphan tracking */
     }
 
-    for (int i = 0; i < svc.port_count; i++) {
-        int port = svc.ports[i].port;
+    /* Resolve container IP and detect host network mode */
+    char container_ip[64] = "";
+    get_container_ip(inspect, container_ip, sizeof(container_ip));
+    int is_host_network = (!container_ip[0]);
 
-        /* per-port override */
-        char key_name[64], key_tags_k[64];
-        snprintf(key_name,   sizeof(key_name),   "CONSUL_SERVICE_%d_NAME", port);
-        snprintf(key_tags_k, sizeof(key_tags_k), "CONSUL_SERVICE_%d_TAGS", port);
-        const char *port_name = get_config(inspect, key_name,   svc_name);
-        const char *port_tags = get_config(inspect, key_tags_k, svc_tags);
+    /* global check interval and POD_IP */
+    const char *check_interval = get_config(inspect, "CONSUL_SERVICE_CHECK_INTERVAL", "10s");
+    const char *global_pod_ip  = get_config(inspect, "CONSUL_SERVICE_POD_IP", "false");
+    int global_use_pod_ip = (strcmp(global_pod_ip, "true") == 0);
+
+    if (is_host_network && global_use_pod_ip)
+        log_debug("POD_IP ignored for %s: container is in host network mode",
+                  container_name);
+
+    for (int i = 0; i < svc.port_count; i++) {
+        int port  = svc.ports[i].host_port;       /* for Consul registration */
+        int cport = svc.ports[i].container_port;   /* for label/env key lookup */
+
+        /* per-port override: labels/env port keys always refer to internal port */
+        char key_name[64], key_tags_k[64], key_pod_ip[64];
+        snprintf(key_name,   sizeof(key_name),   "CONSUL_SERVICE_%d_NAME",   cport);
+        snprintf(key_tags_k, sizeof(key_tags_k), "CONSUL_SERVICE_%d_TAGS",   cport);
+        snprintf(key_pod_ip, sizeof(key_pod_ip), "CONSUL_SERVICE_%d_POD_IP", cport);
+        const char *port_name   = get_config(inspect, key_name,   svc_name);
+        const char *port_tags   = get_config(inspect, key_tags_k, svc_tags);
+        const char *port_pod_ip = get_config(inspect, key_pod_ip, NULL);
+
+        /* POD_IP: per-port > global */
+        int use_pod_ip = global_use_pod_ip;
+        if (port_pod_ip)
+            use_pod_ip = (strcmp(port_pod_ip, "true") == 0);
+
+        /* Address/port resolution priority:
+         * 1. host network mode → always host IP, POD_IP meaningless
+         * 2. POD_IP=true (force) → container IP + internal port
+         * 3. port mapped → host IP + host port
+         * 4. EXPOSE only → container IP + container port */
+        const char *svc_addr;
+        int         reg_port;
+
+        if (is_host_network) {
+            svc_addr = cfg->host_ip;
+            reg_port = cport;
+        } else if (use_pod_ip) {
+            svc_addr = container_ip;
+            reg_port = cport;
+        } else if (svc.host_mapped) {
+            svc_addr = cfg->host_ip;
+            reg_port = port;
+        } else {
+            svc_addr = container_ip;
+            reg_port = cport;
+        }
 
         char tags_json[1024];
         tags_to_json(port_tags, tags_json, sizeof(tags_json));
 
         char service_id[256];
         snprintf(service_id, sizeof(service_id), "%s:%s:%d",
-                 cfg->hostname, container_name, port);
+                 cfg->hostname, container_name, reg_port);
 
         /* build registration JSON */
         cJSON *reg  = cJSON_CreateObject();
@@ -583,14 +684,28 @@ static void register_container(const char *container_id, const Config *cfg)
 
         cJSON_AddStringToObject(reg, "ID",      service_id);
         cJSON_AddStringToObject(reg, "Name",    port_name);
-        cJSON_AddStringToObject(reg, "Address", address);
-        cJSON_AddNumberToObject(reg, "Port",    (double)port);
+        cJSON_AddStringToObject(reg, "Address", svc_addr);
+        cJSON_AddNumberToObject(reg, "Port",    (double)reg_port);
         cJSON_AddItemToObject(reg, "Tags", tags_arr ? tags_arr : cJSON_CreateArray());
 
         cJSON_AddStringToObject(meta, "container_id",   container_id);
         cJSON_AddStringToObject(meta, "container_name", container_name);
         cJSON_AddStringToObject(meta, "registrator",    "self-hosted");
         cJSON_AddItemToObject(reg, "Meta", meta);
+
+        /* TCP health check -- always target container IP:internal port when
+         * available, since the Consul agent on the host can reach all Docker
+         * network subnets via their bridge interfaces. */
+        cJSON *check = cJSON_CreateObject();
+        char tcp_target[128];
+        if (container_ip[0])
+            snprintf(tcp_target, sizeof(tcp_target), "%s:%d", container_ip, cport);
+        else
+            snprintf(tcp_target, sizeof(tcp_target), "%s:%d", svc_addr, reg_port);
+        cJSON_AddStringToObject(check, "TCP",      tcp_target);
+        cJSON_AddStringToObject(check, "Interval", check_interval);
+        cJSON_AddStringToObject(check, "Timeout",  "5s");
+        cJSON_AddItemToObject(reg, "Check", check);
 
         char *reg_str = cJSON_PrintUnformatted(reg);
         cJSON_Delete(reg);
@@ -602,18 +717,21 @@ static void register_container(const char *container_id, const Config *cfg)
         /* Consul returns empty body or "null" on success */
         int ok = (rc == 0 && (!resp || resp[0] == '\0' ||
                                strcmp(resp, "null") == 0));
-        if (ok)
-            log_info("Registered service: %s (%s) addr=%s port=%d",
-                     port_name, service_id, address, port);
-        else
+        if (ok) {
+            if (track_register(service_id))
+                log_info("Registered service: %s (%s) addr=%s port=%d check=tcp/%s",
+                         port_name, service_id, svc_addr, reg_port, check_interval);
+        } else {
             log_error("Registration failed: %s (%s): %s",
                       port_name, service_id, resp ? resp : "curl error");
+        }
 
         free(resp);
         free(reg_str);
     }
 
     cJSON_Delete(inspect);
+    return 1;
 }
 
 /* -- Deregister all services for a container ------------------------------ */
@@ -658,6 +776,7 @@ static void deregister_container(const char *container_id,
             snprintf(path, sizeof(path),
                      "/v1/agent/service/deregister/%s", svc->string);
             consul_request(cfg, "PUT", path, NULL, NULL);
+            track_deregister(svc->string);
             log_info("Deregistered service: %s", svc->string);
         }
     }
@@ -698,6 +817,7 @@ static void cleanup_orphans(char **valid_ids, int n_ids, const Config *cfg)
         }
 
         if (!found) {
+            track_deregister(svc->string);
             log_info("Cleaning orphaned service: %s (container %.12s no longer exists)",
                      svc->string, cid);
             char path[512];
@@ -739,22 +859,9 @@ static void sync_all(const Config *cfg)
         const char *cid  = cJSON_GetStringValue(id_j);
         if (!cid) continue;
 
-        register_container(cid, cfg);
-
-        /* track enabled containers for orphan detection */
-        char  ipath[256];
-        char *istr = NULL;
-        snprintf(ipath, sizeof(ipath), "/containers/%s/json", cid);
-        if (docker_request(cfg, ipath, &istr) == 0 && istr) {
-            cJSON *ins = cJSON_Parse(istr);
-            free(istr);
-            if (ins) {
-                const char *en = get_config(ins, "CONSUL_LISTEN_ENABLE", "false");
-                if (strcmp(en, "true") == 0 && valid_cnt < n)
-                    valid_ids[valid_cnt++] = strdup(cid);
-                cJSON_Delete(ins);
-            }
-        }
+        /* register_container returns 1 if CONSUL_LISTEN_ENABLE=true */
+        if (register_container(cid, cfg) && valid_cnt < n)
+            valid_ids[valid_cnt++] = strdup(cid);
     }
     cJSON_Delete(containers);
 
@@ -896,7 +1003,6 @@ static void watch_events(Config *cfg)
 
     EventCtx ctx;
     buf_init(&ctx.buf);
-    ctx.cfg = cfg;
 
     while (g_running) {
         CURL *curl = curl_easy_init();
@@ -991,10 +1097,6 @@ int main(void)
     cfg.resync_interval = v ? atoi(v) : DEFAULT_RESYNC_INTERVAL;
     if (cfg.resync_interval <= 0) cfg.resync_interval = DEFAULT_RESYNC_INTERVAL;
 
-    v = getenv("DEFAULT_PORT");
-    cfg.default_port = v ? atoi(v) : DEFAULT_PORT_NUM;
-    if (cfg.default_port <= 0) cfg.default_port = DEFAULT_PORT_NUM;
-
     gethostname(cfg.hostname, sizeof(cfg.hostname) - 1);
     v = getenv("HOSTNAME_OVERRIDE");
     if (v) strncpy(cfg.hostname, v, sizeof(cfg.hostname) - 1);
@@ -1016,7 +1118,6 @@ int main(void)
     log_info("Consul:   %s", cfg.consul_addr);
     log_info("Docker:   %s", cfg.docker_sock);
     log_info("Resync:   every %ds", cfg.resync_interval);
-    log_info("Default:  port %d", cfg.default_port);
     log_info("Hostname: %s", cfg.hostname);
     log_info("Host IP:  %s", cfg.host_ip);
     log_info("Mode:     opt-in (CONSUL_LISTEN_ENABLE=true)");
