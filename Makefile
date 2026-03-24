@@ -21,7 +21,7 @@ clean:
 docker:
 	docker build -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
-# Push both tags to registry (build first if not built)
+# Push both tags to registry
 push:
 	docker push $(IMAGE):$(VERSION)
 	docker push $(IMAGE):latest
@@ -30,19 +30,19 @@ push:
 patch:
 	@awk -F. '{printf "%d.%d.%d\n", $$1, $$2, $$3+1}' VERSION > VERSION.tmp && mv VERSION.tmp VERSION
 	@echo "Version: $$(cat VERSION)"
-	$(MAKE) push
+	$(MAKE) docker push
 
 # Bump minor (0.1.0 → 0.2.0), build, and push
 minor:
 	@awk -F. '{printf "%d.%d.0\n", $$1, $$2+1}' VERSION > VERSION.tmp && mv VERSION.tmp VERSION
 	@echo "Version: $$(cat VERSION)"
-	$(MAKE) push
+	$(MAKE) docker push
 
 # Bump major (0.1.0 → 1.0.0), build, and push
 major:
 	@awk -F. '{printf "%d.0.0\n", $$1+1}' VERSION > VERSION.tmp && mv VERSION.tmp VERSION
 	@echo "Version: $$(cat VERSION)"
-	$(MAKE) push
+	$(MAKE) docker push
 
 # Alias: bump patch + build + push (most common)
 release: patch
