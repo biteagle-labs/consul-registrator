@@ -1,6 +1,6 @@
 services:
   registrator:
-    build: .
+    image: biteagle/consul-registrator:latest
     container_name: registrator
     network_mode: host
     restart: always
@@ -10,8 +10,9 @@ services:
       - REGISTRATOR_TOKEN=${REGISTRATOR_TOKEN}
       - CONSUL_ADDR=${CONSUL_ADDR:-http://localhost:8500}
       - RESYNC_INTERVAL=${RESYNC_INTERVAL:-30}
-      - DEFAULT_PORT=${DEFAULT_PORT:-8080}
       - ADVERTISE_ADDR=${ADVERTISE_ADDR:-}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - HOSTNAME_OVERRIDE=${HOSTNAME_OVERRIDE:-}
     logging:
       driver: json-file
       options:

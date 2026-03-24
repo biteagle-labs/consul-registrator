@@ -10,9 +10,12 @@
 
 - **Opt-in 模式** — 仅设置了 `CONSUL_LISTEN_ENABLE=true` 的容器才会被注册
 - **双通道配置** — 优先读取容器环境变量，其次读取 labels
-- **自动端口检测** — `CONSUL_SERVICE_PORT` > HostPort 端口映射 > EXPOSE > 默认 8080
+- **自动端口检测** — `CONSUL_SERVICE_PORT` > HostPort 端口映射 > EXPOSE；无可检测端口的容器将被跳过
+- **TCP 健康检查** — 自动生成 Consul TCP 检查，目标为 `容器IP:容器端口`
 - **智能地址解析** — 有端口映射的容器使用宿主机 IP，bridge/自定义网络容器使用容器 IP
+- **POD_IP 模式** — 强制使用容器 IP + 内部端口注册（支持全局或按端口配置）
 - **按端口配置服务** — 通过 `CONSUL_SERVICE_<port>_NAME` 为每个容器注册多个服务
+- **变更日志** — 全量同步时仅在状态变化时输出日志，减少噪音
 - **定时全量同步** — 按间隔全量同步，捕获遗漏事件并清理孤立服务
 - **三线程架构** — 事件流 + 事件处理器 + 全量同步，互不阻塞
 
@@ -33,8 +36,9 @@ services:
       - REGISTRATOR_TOKEN=${REGISTRATOR_TOKEN}
       - CONSUL_ADDR=${CONSUL_ADDR:-http://localhost:8500}
       - RESYNC_INTERVAL=${RESYNC_INTERVAL:-30}
-      - DEFAULT_PORT=${DEFAULT_PORT:-8080}
       - ADVERTISE_ADDR=${ADVERTISE_ADDR:-}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - HOSTNAME_OVERRIDE=${HOSTNAME_OVERRIDE:-}
     logging:
       driver: json-file
       options:
@@ -97,26 +101,38 @@ docker run -d -p 8080:80 \
 | `CONSUL_LISTEN_ENABLE` | 设置为 `true` 启用注册（必须设置） | `false` |
 | `CONSUL_SERVICE_NAME` | Consul 中的服务名 | 镜像名 |
 | `CONSUL_SERVICE_TAGS` | 逗号分隔的标签 | _（空）_ |
-| `CONSUL_SERVICE_PORT` | 覆盖自动检测的端口 | 自动检测 |
+| `CONSUL_SERVICE_PORT` | 覆盖自动检测的端口（内部/容器端口） | 自动检测 |
+| `CONSUL_SERVICE_CHECK_INTERVAL` | TCP 健康检查间隔 | `10s` |
+| `CONSUL_SERVICE_POD_IP` | 设为 `true` 使用容器 IP + 内部端口注册 | `false` |
 | `CONSUL_SERVICE_<port>_NAME` | 指定端口的服务名 | 同上 |
 | `CONSUL_SERVICE_<port>_TAGS` | 指定端口的标签 | 同上 |
+| `CONSUL_SERVICE_<port>_POD_IP` | 按端口覆盖 POD_IP 设置 | 同全局 |
 
 ### 端口检测优先级
 
 1. `CONSUL_SERVICE_PORT` 环境变量 / label
 2. Docker 端口映射（`HostPort`）
 3. Dockerfile 中的 `EXPOSE` 指令
-4. 默认端口（8080）
+
+无法检测到任何端口的容器将被**跳过**（不注册）。这避免了使用虚构端口创建服务和始终失败的健康检查。
+
+### 健康检查
+
+系统为每个注册的服务自动创建 TCP 健康检查：
+- 优先目标为 `容器IP:容器端口`（首选，因为 Consul agent 可通过 Docker bridge 网络访问容器）
+- 否则回退到 `服务地址:服务端口`
+- 默认间隔：`10s`（可通过 `CONSUL_SERVICE_CHECK_INTERVAL` 配置）
 
 ### 地址解析
 
 注册到 Consul 的服务地址自动确定：
 
-| 场景 | 地址 |
-|------|------|
-| 有端口映射的容器（`-p`） | 宿主机 IP（自动检测或 `ADVERTISE_ADDR`） |
-| bridge/自定义网络容器（无端口映射） | 容器 IP |
-| `network_mode: host` 的容器 | 宿主机 IP |
+| 场景 | 地址 | 端口 |
+|------|------|------|
+| 有端口映射的容器（`-p`） | 宿主机 IP | 宿主机端口 |
+| bridge/自定义网络容器（无端口映射） | 容器 IP | 容器端口 |
+| `network_mode: host` 的容器 | 宿主机 IP | 容器端口 |
+| `CONSUL_SERVICE_POD_IP=true` | 容器 IP | 容器端口 |
 
 宿主机 IP 检测优先级：`ADVERTISE_ADDR` 环境变量 > `getaddrinfo(hostname)` > UDP 探测出口 IP。
 
@@ -129,22 +145,114 @@ Registrator 容器的环境变量：
 | `REGISTRATOR_TOKEN` | Consul ACL token | _（无）_ |
 | `CONSUL_ADDR` | Consul HTTP 地址 | `http://localhost:8500` |
 | `RESYNC_INTERVAL` | 全量同步间隔（秒） | `30` |
-| `DEFAULT_PORT` | 无法检测端口时的默认值 | `8080` |
 | `ADVERTISE_ADDR` | 覆盖自动检测的宿主机 IP | 自动检测 |
+| `HOSTNAME_OVERRIDE` | 覆盖系统主机名（用于 service ID） | 系统主机名 |
+| `LOG_LEVEL` | 设为 `debug` 输出详细日志 | `info` |
 
 ## 架构
 
+### 线程模型
+
+注册器运行三个互不阻塞的线程：
+
 ```
-Docker daemon
-    │
-    ├─ /var/run/docker.sock ──► registrator 容器 (host 网络)
-    │                              │
-    │   ┌──────────────────────────┘
-    │   │
-    │   ├─ libcurl unix-socket → Docker API (/events 流式, /containers)
-    │   └─ libcurl HTTP → Consul HTTP API (/v1/agent/service/register|deregister)
-    │
-    └─ 业务容器 (仅 CONSUL_LISTEN_ENABLE=true 的容器会被注册)
+┌─────────────────────────────────────────────────────────────────────┐
+│                     registrator 容器 (host 网络)                     │
+│                                                                     │
+│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐  │
+│  │ 主线程        │    │ 事件处理线程  │    │ 全量同步线程           │  │
+│  │              │    │              │    │                       │  │
+│  │ curl SSE     │    │              │    │ sleep(N)              │  │
+│  │ /events ─────┼──► │ 出队 ──────► │    │   │                   │  │
+│  │ (长连接)      │ 队列│ 注册 / 注销  │    │   ▼                   │  │
+│  │              │    │              │    │ sync_all()            │  │
+│  └──────┬───────┘    └──────┬───────┘    │  ├─ register_container│  │
+│         │                   │            │  └─ cleanup_orphans   │  │
+│         │                   │            └───────────┬───────────┘  │
+│         │ unix sock         │ HTTP                   │ HTTP         │
+└─────────┼───────────────────┼───────────────────────┼──────────────┘
+          │                   │                       │
+          ▼                   ▼                       ▼
+   Docker daemon         Consul agent           Consul agent
+   /events 事件流        /v1/agent/service/*     /v1/agent/service/*
+```
+
+- **主线程** — 维持到 Docker `/events` 的 SSE 长连接。curl 回调中解析 JSON 行，推入事件队列。此线程不做任何 Consul I/O。
+- **事件处理线程** — 等待事件队列（`pthread_cond_wait`）。`start` → `register_container()`；`stop`/`die` → `deregister_container()`。
+- **全量同步线程** — 每隔 `RESYNC_INTERVAL` 秒执行 `sync_all()`：重新注册所有 enabled 容器，清理容器已不存在的孤立服务。
+
+### 启动流程
+
+```
+main()
+ ├─ 加载环境变量配置 (CONSUL_ADDR, REGISTRATOR_TOKEN, ...)
+ ├─ resolve_host_ip() 解析宿主机 IP
+ │    ├─ 1. ADVERTISE_ADDR 环境变量
+ │    ├─ 2. getaddrinfo(hostname)，跳过 127.x.x.x
+ │    ├─ 3. UDP connect trick（通过内核路由获取出口 IP）
+ │    └─ 4. 回退到 hostname 字符串
+ ├─ preflight_check() 预检
+ │    ├─ Docker API: GET /info
+ │    └─ Consul API: GET /v1/status/leader
+ ├─ sync_all()  ← 首次全量同步
+ ├─ 启动 resync_thread
+ ├─ 启动 event_processor_thread
+ └─ watch_events()  ← 主线程阻塞
+```
+
+### 注册流程
+
+对每个设置了 `CONSUL_LISTEN_ENABLE=true` 的容器：
+
+```
+register_container(container_id)
+ │
+ ├─ Docker API: GET /containers/{id}/json
+ │
+ ├─ 门控: CONSUL_LISTEN_ENABLE != "true" → 跳过 (return 0)
+ │
+ ├─ detect_ports() 端口检测
+ │    ├─ 1. CONSUL_SERVICE_PORT → 反查 HostPort 映射
+ │    ├─ 2. NetworkSettings.Ports 中的 HostPort 绑定（去重）
+ │    ├─ 3. Config.ExposedPorts (EXPOSE)
+ │    └─ 4. 无端口 → port_count=0，跳过注册
+ │
+ ├─ 门控: port_count == 0 → 跳过 (return 1，仍计入 enabled)
+ │
+ ├─ 检测网络模式
+ │    └─ container_ip 为空 → is_host_network = true
+ │
+ └─ 逐端口注册:
+      │
+      ├─ 读取按端口配置 (CONSUL_SERVICE_{port}_NAME / _TAGS / _POD_IP)
+      │
+      ├─ 地址解析（四级优先级）:
+      │    ├─ host 网络    → host_ip + 容器端口      (POD_IP 无效)
+      │    ├─ POD_IP=true  → container_ip + 容器端口  (强制覆盖)
+      │    ├─ 有端口映射    → host_ip + 宿主机端口    (默认)
+      │    └─ 仅 EXPOSE    → container_ip + 容器端口
+      │
+      ├─ TCP 健康检查目标:
+      │    ├─ 有 container_ip → container_ip:容器端口
+      │    └─ 否则           → 服务地址:服务端口
+      │
+      └─ PUT /v1/agent/service/register
+           { ID, Name, Address, Port, Tags, Meta, Check }
+```
+
+### 注销与孤儿清理
+
+```
+deregister_container(container_id)         cleanup_orphans(valid_ids)
+ │                                          │
+ ├─ GET /v1/agent/services                  ├─ GET /v1/agent/services
+ │                                          │
+ ├─ 匹配策略:                                ├─ 过滤: Meta.registrator == "self-hosted"
+ │   1. Meta.container_id                   │
+ │   2. service_id 前缀（回退）               ├─ Meta.container_id 不在 valid_ids 中？
+ │                                          │   → 容器已不存在，注销服务
+ └─ PUT /v1/agent/service/deregister/{id}   │
+                                            └─ PUT /v1/agent/service/deregister/{id}
 ```
 
 ## 许可证
