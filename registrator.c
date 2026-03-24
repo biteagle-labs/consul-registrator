@@ -177,6 +177,7 @@ static int docker_request(const Config *cfg, const char *path, char **out)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode rc = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
@@ -219,6 +220,7 @@ static int consul_request(const Config *cfg, const char *method,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     if (body) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     }
@@ -1016,6 +1018,14 @@ static size_t event_write_cb(char *ptr, size_t size, size_t nmemb, void *userdat
 
 /* -- Event watch main loop ------------------------------------------------ */
 
+/* Progress callback: abort curl when shutdown is requested */
+static int xferinfo_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                        curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)clientp; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    return g_running ? 0 : 1;   /* non-zero aborts the transfer */
+}
+
 static void watch_events(Config *cfg)
 {
     log_info("Watching Docker events...");
@@ -1029,7 +1039,7 @@ static void watch_events(Config *cfg)
 
     while (g_running) {
         CURL *curl = curl_easy_init();
-        if (!curl) { sleep(5); continue; }
+        if (!curl) { sleep(1); continue; }
 
         curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, cfg->docker_sock);
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -1037,13 +1047,17 @@ static void watch_events(Config *cfg)
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);        /* no timeout */
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);       /* thread-safe */
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);     /* enable progress cb */
 
         CURLcode rc = curl_easy_perform(curl);
         curl_easy_cleanup(curl);
 
         if (g_running) {
             log_warn("Event stream disconnected (rc=%d), reconnecting in 5s...", (int)rc);
-            sleep(5);
+            for (int i = 0; i < 5 && g_running; i++)
+                sleep(1);
         }
     }
 
@@ -1056,7 +1070,9 @@ static void *resync_thread(void *arg)
 {
     Config *cfg = (Config *)arg;
     while (g_running) {
-        sleep((unsigned int)cfg->resync_interval);
+        /* Sleep in 1-second increments for quick shutdown response */
+        for (int i = 0; i < cfg->resync_interval && g_running; i++)
+            sleep(1);
         if (g_running) sync_all(cfg);
     }
     return NULL;
@@ -1132,9 +1148,16 @@ int main(void)
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT,  sig_handler);
-    signal(SIGHUP,  sig_handler);
+    /* Use sigaction WITHOUT SA_RESTART so signals interrupt blocking syscalls
+     * (e.g. curl_easy_perform's underlying recv()). signal() sets SA_RESTART
+     * on Linux/glibc, which would prevent SIGTERM from interrupting curl. */
+    struct sigaction sa;
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   /* no SA_RESTART */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);
 
     log_info("=========================================");
     log_info("Consul Registrator (C) starting");
@@ -1153,9 +1176,21 @@ int main(void)
 
     sync_all(&cfg);
 
+    /* Block signals in child threads so SIGTERM is delivered only to the
+     * main thread (which runs curl_easy_perform and can be interrupted). */
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGTERM);
+    sigaddset(&sigset, SIGINT);
+    sigaddset(&sigset, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+
     pthread_t resync_tid, evproc_tid;
     pthread_create(&resync_tid, NULL, resync_thread, &cfg);
     pthread_create(&evproc_tid, NULL, event_processor_thread, &cfg);
+
+    /* Unblock signals in main thread */
+    pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
 
     watch_events(&cfg); /* blocks until g_running = 0 */
 

@@ -14,4 +14,5 @@ RUN apk add --no-cache libcurl cjson
 
 COPY --from=builder /src/registrator /usr/local/bin/registrator
 
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/registrator"]
