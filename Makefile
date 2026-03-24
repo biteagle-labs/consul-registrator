@@ -5,7 +5,7 @@ TARGET  = registrator
 SRCS    = registrator.c
 
 IMAGE   = biteagle/consul-registrator
-VERSION = $(shell cat VERSION 2>/dev/null || echo 0.0.0)
+VERSION = $(strip $(file < VERSION))
 
 .PHONY: all clean docker push release patch minor major
 
