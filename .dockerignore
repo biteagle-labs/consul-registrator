@@ -1,0 +1,9 @@
+# Only include files needed for the Docker build
+# Dockerfile COPY uses: registrator.c, Makefile
+
+# Everything excluded by default
+*
+
+# Allow build essentials
+!registrator.c
+!Makefile
