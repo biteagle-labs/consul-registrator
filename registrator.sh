@@ -228,7 +228,19 @@ detect_ports() {
         return
     fi
 
-    # 3. EXPOSE ports (no host mapping -- container IP)
+    # 3. NetworkSettings.Ports keys (ports known to Docker but not host-mapped,
+    #    e.g. compose "expose:" or compose network ports with null bindings)
+    local ports_keys
+    ports_keys=$(echo "$inspect_json" | jq '
+        [.NetworkSettings.Ports // {} | keys[] | split("/")[0] | tonumber] | unique |
+        [.[] | {host_port: ., container_port: ., host_mapped: false}]' 2>/dev/null)
+
+    if [ -n "$ports_keys" ] && [ "$ports_keys" != "[]" ]; then
+        echo "$ports_keys"
+        return
+    fi
+
+    # 4. EXPOSE ports from Dockerfile (Config.ExposedPorts)
     local exposed
     exposed=$(echo "$inspect_json" | jq '
         [.Config.ExposedPorts // {} | keys[] | split("/")[0] | tonumber] | unique |
@@ -239,7 +251,7 @@ detect_ports() {
         return
     fi
 
-    # 4. No port detected
+    # 5. No port detected
     echo "[]"
 }
 
@@ -310,7 +322,7 @@ register_container() {
     local check_interval
     check_interval=$(get_container_config "$inspect_json" "CONSUL_SERVICE_CHECK_INTERVAL" "10s")
     local global_pod_ip
-    global_pod_ip=$(get_container_config "$inspect_json" "CONSUL_SERVICE_POD_IP" "false")
+    global_pod_ip=$(get_container_config "$inspect_json" "CONSUL_SERVICE_POD_IP" "true")
 
     if [ "$is_host_network" = "true" ] && [ "$global_pod_ip" = "true" ]; then
         log_debug "POD_IP ignored for $container_name: container is in host network mode"

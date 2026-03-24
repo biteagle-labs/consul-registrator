@@ -284,7 +284,7 @@ static void extract_image_name(const char *image, char *out, size_t out_sz)
     out[len] = '\0';
 }
 
-/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > EXPOSE -------------- */
+/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > Ports keys > EXPOSE - */
 
 static void detect_ports(cJSON *inspect, ServiceDef *svc)
 {
@@ -367,7 +367,30 @@ static void detect_ports(cJSON *inspect, ServiceDef *svc)
         return;
     }
 
-    /* 3. EXPOSE (no host mapping -- container IP) */
+    /* 3. NetworkSettings.Ports keys (ports known to Docker but not host-mapped,
+     *    e.g. compose "expose:" or compose network ports with null bindings) */
+    if (cJSON_IsObject(ports_obj)) {
+        cJSON *entry;
+        cJSON_ArrayForEach(entry, ports_obj) {
+            if (entry->string && svc->port_count < MAX_PORTS) {
+                int port = atoi(entry->string);
+                if (port > 0) {
+                    int dup = 0;
+                    for (int k = 0; k < svc->port_count; k++) {
+                        if (svc->ports[k].container_port == port) { dup = 1; break; }
+                    }
+                    if (!dup) {
+                        svc->ports[svc->port_count].host_port      = port;
+                        svc->ports[svc->port_count].container_port = port;
+                        svc->port_count++;
+                    }
+                }
+            }
+        }
+    }
+    if (svc->port_count > 0) return;
+
+    /* 4. EXPOSE from Dockerfile (Config.ExposedPorts) */
     cJSON *config  = cJSON_GetObjectItem(inspect, "Config");
     cJSON *exposed = cJSON_GetObjectItem(config, "ExposedPorts");
     if (cJSON_IsObject(exposed)) {
@@ -385,7 +408,7 @@ static void detect_ports(cJSON *inspect, ServiceDef *svc)
     }
     if (svc->port_count > 0) return;
 
-    /* 4. No port detected -- leave port_count = 0.
+    /* 5. No port detected -- leave port_count = 0.
      * Services without any port (no CONSUL_SERVICE_PORT, no HostPort mapping,
      * no EXPOSE) should not be registered with Consul, as a fabricated default
      * port would create a health check that always fails. */
@@ -623,7 +646,7 @@ static int register_container(const char *container_id, const Config *cfg)
 
     /* global check interval and POD_IP */
     const char *check_interval = get_config(inspect, "CONSUL_SERVICE_CHECK_INTERVAL", "10s");
-    const char *global_pod_ip  = get_config(inspect, "CONSUL_SERVICE_POD_IP", "false");
+    const char *global_pod_ip  = get_config(inspect, "CONSUL_SERVICE_POD_IP", "true");
     int global_use_pod_ip = (strcmp(global_pod_ip, "true") == 0);
 
     if (is_host_network && global_use_pod_ip)

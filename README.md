@@ -103,18 +103,19 @@ Set via container environment variables (`-e`) or labels (`-l`). Environment var
 | `CONSUL_SERVICE_TAGS` | Comma-separated tags | _(empty)_ |
 | `CONSUL_SERVICE_PORT` | Override auto-detected port (internal/container port) | Auto-detect |
 | `CONSUL_SERVICE_CHECK_INTERVAL` | TCP health check interval | `10s` |
-| `CONSUL_SERVICE_POD_IP` | Set to `true` to register with container IP + internal port | `false` |
+| `CONSUL_SERVICE_POD_IP` | Set to `false` to use host IP + host port for port-mapped containers | `true` |
 | `CONSUL_SERVICE_<port>_NAME` | Service name for a specific port | Same as above |
 | `CONSUL_SERVICE_<port>_TAGS` | Tags for a specific port | Same as above |
-| `CONSUL_SERVICE_<port>_POD_IP` | Per-port POD_IP override | Same as global |
+| `CONSUL_SERVICE_<port>_POD_IP` | Per-port POD_IP override | `true` |
 
 ### Port Detection Priority
 
 1. `CONSUL_SERVICE_PORT` environment variable / label
 2. Docker port mapping (`HostPort`)
-3. `EXPOSE` directive from Dockerfile
+3. `NetworkSettings.Ports` keys (catches compose `expose:` and other Docker-known ports)
+4. `EXPOSE` directive from Dockerfile
 
-Containers with no detectable port are **skipped** (not registered). This avoids creating services with fabricated ports and health checks that always fail.
+Containers with no detectable port are **skipped** (not registered). For docker-compose services without explicit port declarations, add `expose:` in the compose file or `EXPOSE` in the Dockerfile.
 
 ### Health Check
 
@@ -129,10 +130,10 @@ The service address registered in Consul is determined automatically:
 
 | Scenario | Address | Port |
 |----------|---------|------|
-| Container with port mapping (`-p`) | Host IP | Host port |
-| Container on bridge/custom network (no port mapping) | Container IP | Container port |
 | Container with `network_mode: host` | Host IP | Container port |
-| `CONSUL_SERVICE_POD_IP=true` | Container IP | Container port |
+| Non-host container (default, `POD_IP=true`) | Container IP | Container port |
+| Non-host + `CONSUL_SERVICE_POD_IP=false` + port mapping | Host IP | Host port |
+| Non-host + `CONSUL_SERVICE_POD_IP=false` + EXPOSE only | Container IP | Container port |
 
 Host IP detection priority: `ADVERTISE_ADDR` env > `getaddrinfo(hostname)` > outbound IP via UDP probe.
 
@@ -227,10 +228,10 @@ register_container(container_id)
       ├─ Read per-port config (CONSUL_SERVICE_{port}_NAME / _TAGS / _POD_IP)
       │
       ├─ Address resolution (4-level priority):
-      │    ├─ host network   → host_ip + container_port  (POD_IP ignored)
-      │    ├─ POD_IP=true    → container_ip + container_port  (forced)
-      │    ├─ port mapped    → host_ip + host_port  (default)
-      │    └─ EXPOSE only    → container_ip + container_port
+      │    ├─ host network      → host_ip + container_port  (POD_IP ignored)
+      │    ├─ POD_IP=true (def) → container_ip + container_port
+      │    ├─ POD_IP=false + mapped → host_ip + host_port
+      │    └─ POD_IP=false + EXPOSE → container_ip + container_port
       │
       ├─ TCP health check target:
       │    ├─ container_ip available → container_ip:container_port

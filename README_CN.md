@@ -103,18 +103,19 @@ docker run -d -p 8080:80 \
 | `CONSUL_SERVICE_TAGS` | 逗号分隔的标签 | _（空）_ |
 | `CONSUL_SERVICE_PORT` | 覆盖自动检测的端口（内部/容器端口） | 自动检测 |
 | `CONSUL_SERVICE_CHECK_INTERVAL` | TCP 健康检查间隔 | `10s` |
-| `CONSUL_SERVICE_POD_IP` | 设为 `true` 使用容器 IP + 内部端口注册 | `false` |
+| `CONSUL_SERVICE_POD_IP` | 设为 `false` 则对端口映射容器使用宿主机 IP + 宿主机端口 | `true` |
 | `CONSUL_SERVICE_<port>_NAME` | 指定端口的服务名 | 同上 |
 | `CONSUL_SERVICE_<port>_TAGS` | 指定端口的标签 | 同上 |
-| `CONSUL_SERVICE_<port>_POD_IP` | 按端口覆盖 POD_IP 设置 | 同全局 |
+| `CONSUL_SERVICE_<port>_POD_IP` | 按端口覆盖 POD_IP 设置 | `true` |
 
 ### 端口检测优先级
 
 1. `CONSUL_SERVICE_PORT` 环境变量 / label
 2. Docker 端口映射（`HostPort`）
-3. Dockerfile 中的 `EXPOSE` 指令
+3. `NetworkSettings.Ports` keys（捕获 compose `expose:` 等 Docker 已知端口）
+4. Dockerfile 中的 `EXPOSE` 指令
 
-无法检测到任何端口的容器将被**跳过**（不注册）。这避免了使用虚构端口创建服务和始终失败的健康检查。
+无法检测到任何端口的容器将被**跳过**（不注册）。对于没有显式端口声明的 docker-compose 服务，请在 compose 文件中添加 `expose:` 或在 Dockerfile 中添加 `EXPOSE`。
 
 ### 健康检查
 
@@ -129,10 +130,10 @@ docker run -d -p 8080:80 \
 
 | 场景 | 地址 | 端口 |
 |------|------|------|
-| 有端口映射的容器（`-p`） | 宿主机 IP | 宿主机端口 |
-| bridge/自定义网络容器（无端口映射） | 容器 IP | 容器端口 |
 | `network_mode: host` 的容器 | 宿主机 IP | 容器端口 |
-| `CONSUL_SERVICE_POD_IP=true` | 容器 IP | 容器端口 |
+| 非 host 网络容器（默认，`POD_IP=true`） | 容器 IP | 容器端口 |
+| 非 host + `CONSUL_SERVICE_POD_IP=false` + 有端口映射 | 宿主机 IP | 宿主机端口 |
+| 非 host + `CONSUL_SERVICE_POD_IP=false` + 仅 EXPOSE | 容器 IP | 容器端口 |
 
 宿主机 IP 检测优先级：`ADVERTISE_ADDR` 环境变量 > `getaddrinfo(hostname)` > UDP 探测出口 IP。
 
@@ -227,10 +228,10 @@ register_container(container_id)
       ├─ 读取按端口配置 (CONSUL_SERVICE_{port}_NAME / _TAGS / _POD_IP)
       │
       ├─ 地址解析（四级优先级）:
-      │    ├─ host 网络    → host_ip + 容器端口      (POD_IP 无效)
-      │    ├─ POD_IP=true  → container_ip + 容器端口  (强制覆盖)
-      │    ├─ 有端口映射    → host_ip + 宿主机端口    (默认)
-      │    └─ 仅 EXPOSE    → container_ip + 容器端口
+      │    ├─ host 网络          → host_ip + 容器端口      (POD_IP 无效)
+      │    ├─ POD_IP=true (默认) → container_ip + 容器端口
+      │    ├─ POD_IP=false + 有映射 → host_ip + 宿主机端口
+      │    └─ POD_IP=false + 仅 EXPOSE → container_ip + 容器端口
       │
       ├─ TCP 健康检查目标:
       │    ├─ 有 container_ip → container_ip:容器端口
