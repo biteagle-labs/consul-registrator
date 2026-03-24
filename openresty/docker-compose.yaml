@@ -1,0 +1,17 @@
+services:
+  gateway:
+    build: .
+    container_name: consul-gateway
+    network_mode: host
+    restart: always
+    environment:
+      - DOMAIN_SUFFIX=${DOMAIN_SUFFIX:-svc.local}
+      - CONSUL_ADDR=${CONSUL_ADDR:-http://127.0.0.1:8500}
+      - CONSUL_TOKEN=${CONSUL_TOKEN:-}
+      - POLL_INTERVAL=${POLL_INTERVAL:-5}
+      - FILTER_TAGS=${FILTER_TAGS:-web,prometheus}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

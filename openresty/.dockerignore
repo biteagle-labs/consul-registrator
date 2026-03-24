@@ -1,0 +1,9 @@
+# Only include files needed for the Docker build
+# Dockerfile COPY uses: lua/**/*, nginx.conf
+
+# Everything excluded by default
+*
+
+# Allow build essentials
+!lua/
+!nginx.conf

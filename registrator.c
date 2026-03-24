@@ -716,6 +716,7 @@ static int register_container(const char *container_id, const Config *cfg)
         cJSON_AddStringToObject(meta, "container_id",   container_id);
         cJSON_AddStringToObject(meta, "container_name", container_name);
         cJSON_AddStringToObject(meta, "registrator",    "self-hosted");
+        cJSON_AddStringToObject(meta, "by",             cfg->hostname);
         cJSON_AddItemToObject(reg, "Meta", meta);
 
         /* TCP health check -- always target container IP:internal port when
@@ -810,7 +811,7 @@ static void deregister_container(const char *container_id,
 
 /* -- Clean up orphaned services ------------------------------------------- */
 
-static void cleanup_orphans(char **valid_ids, int n_ids, const Config *cfg)
+static void cleanup_orphans(char **all_ids, int n_all, const Config *cfg)
 {
     char *resp = NULL;
     if (consul_request(cfg, "GET", "/v1/agent/services", NULL, &resp) != 0 || !resp) {
@@ -822,32 +823,50 @@ static void cleanup_orphans(char **valid_ids, int n_ids, const Config *cfg)
     free(resp);
     if (!services) return;
 
+    size_t hlen = strlen(cfg->hostname);
+
     cJSON *svc;
     cJSON_ArrayForEach(svc, services) {
         if (!svc->string) continue;
+        const char *sid = svc->string;
 
-        /* only process services registered by this registrator */
         cJSON      *meta  = cJSON_GetObjectItem(svc, "Meta");
-        cJSON      *reg_j = cJSON_GetObjectItem(meta, "registrator");
-        if (!cJSON_IsString(reg_j) ||
-            strcmp(cJSON_GetStringValue(reg_j), "self-hosted") != 0) continue;
+        cJSON      *reg_j = meta ? cJSON_GetObjectItem(meta, "registrator") : NULL;
+        int is_self_hosted = (cJSON_IsString(reg_j) &&
+                              strcmp(cJSON_GetStringValue(reg_j), "self-hosted") == 0);
 
-        cJSON      *cid_j = cJSON_GetObjectItem(meta, "container_id");
+        /* Primary: match by "by" meta (set by current version) */
+        cJSON      *by_j = meta ? cJSON_GetObjectItem(meta, "by") : NULL;
+        int node_match = (cJSON_IsString(by_j) &&
+                          strcmp(cJSON_GetStringValue(by_j), cfg->hostname) == 0);
+
+        /* Fallback: hostname prefix in service ID (for older versions
+         * that have registrator=self-hosted but no registrator_node) */
+        int hostname_match = (is_self_hosted &&
+                              strncmp(sid, cfg->hostname, hlen) == 0 &&
+                              sid[hlen] == ':');
+
+        if (!node_match && !hostname_match) continue;
+
+        cJSON      *cid_j = meta ? cJSON_GetObjectItem(meta, "container_id") : NULL;
         const char *cid   = cJSON_GetStringValue(cid_j);
-        if (!cid) continue;
 
         int found = 0;
-        for (int i = 0; i < n_ids; i++) {
-            if (strcmp(valid_ids[i], cid) == 0) { found = 1; break; }
+        if (cid) {
+            for (int i = 0; i < n_all; i++) {
+                if (strcmp(all_ids[i], cid) == 0) { found = 1; break; }
+            }
         }
+        /* No container_id in meta but hostname matches → cannot verify,
+         * treat as orphaned since it was likely registered by us. */
 
         if (!found) {
-            track_deregister(svc->string);
+            track_deregister(sid);
             log_info("Cleaning orphaned service: %s (container %.12s no longer exists)",
-                     svc->string, cid);
+                     sid, cid ? cid : "unknown");
             char path[512];
             snprintf(path, sizeof(path),
-                     "/v1/agent/service/deregister/%s", svc->string);
+                     "/v1/agent/service/deregister/%s", sid);
             consul_request(cfg, "PUT", path, NULL, NULL);
         }
     }
@@ -874,9 +893,9 @@ static void sync_all(const Config *cfg)
         return;
     }
 
-    int    n         = cJSON_GetArraySize(containers);
-    char **valid_ids = calloc((size_t)n, sizeof(char *));
-    int    valid_cnt = 0;
+    int    n       = cJSON_GetArraySize(containers);
+    char **all_ids = calloc((size_t)n, sizeof(char *));
+    int    all_cnt = 0;
 
     for (int i = 0; i < n; i++) {
         cJSON      *c   = cJSON_GetArrayItem(containers, i);
@@ -884,16 +903,18 @@ static void sync_all(const Config *cfg)
         const char *cid  = cJSON_GetStringValue(id_j);
         if (!cid) continue;
 
+        if (all_cnt < n)
+            all_ids[all_cnt++] = strdup(cid);
+
         /* register_container returns 1 if CONSUL_LISTEN_ENABLE=true */
-        if (register_container(cid, cfg) && valid_cnt < n)
-            valid_ids[valid_cnt++] = strdup(cid);
+        register_container(cid, cfg);
     }
     cJSON_Delete(containers);
 
-    cleanup_orphans(valid_ids, valid_cnt, cfg);
+    cleanup_orphans(all_ids, all_cnt, cfg);
 
-    for (int i = 0; i < valid_cnt; i++) free(valid_ids[i]);
-    free(valid_ids);
+    for (int i = 0; i < all_cnt; i++) free(all_ids[i]);
+    free(all_ids);
 
     log_debug("Full sync completed");
 }
