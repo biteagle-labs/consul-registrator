@@ -9,6 +9,10 @@ local DOMAIN_SUFFIX
 local POLL_INTERVAL
 local FILTER_TAGS
 
+-- state for incremental route updates and change detection
+local prev_names    = {}
+local prev_snapshot = ""
+
 local function init_config()
     CONSUL_ADDR   = os.getenv("CONSUL_ADDR")   or "http://127.0.0.1:8500"
     CONSUL_TOKEN  = os.getenv("CONSUL_TOKEN")   or ""
@@ -49,7 +53,7 @@ local function poll_consul(premature)
     })
 
     if not res then
-        ngx.log(ngx.ERR, "[discovery] consul request failed: ", err)
+        ngx.log(ngx.ERR, "[discovery] consul poll failed: ", err)
         return
     end
 
@@ -67,7 +71,8 @@ local function poll_consul(premature)
     -- group backends by service name
     local table_new = {}
     for _, svc in pairs(services) do
-        if has_matching_tag(svc.Tags) and svc.Address and svc.Address ~= "" and svc.Port and svc.Port > 0 then
+        if has_matching_tag(svc.Tags) and svc.Address and svc.Address ~= ""
+           and svc.Port and svc.Port > 0 then
             local name = svc.Service
             if not table_new[name] then
                 table_new[name] = {}
@@ -79,26 +84,48 @@ local function poll_consul(premature)
         end
     end
 
-    -- flush old routes and write new ones
-    routes:flush_all()
-    routes:flush_expired()
-
-    local count = 0
+    -- incremental update: set new/updated routes, remove stale ones
+    -- (preserves rr: counters for services that still exist)
+    local curr_names = {}
     for name, backends in pairs(table_new) do
         routes:set(name, cjson.encode(backends))
-        count = count + 1
+        curr_names[name] = true
     end
+    for name in pairs(prev_names) do
+        if not curr_names[name] then
+            routes:delete(name)
+            routes:delete("rr:" .. name)
+        end
+    end
+    prev_names = curr_names
 
-    ngx.log(ngx.DEBUG, "[discovery] updated ", count, " service routes")
+    -- change-only logging: service name -> backend IPs
+    local log_parts = {}
+    for name, backends in pairs(table_new) do
+        local addrs = {}
+        for _, b in ipairs(backends) do
+            addrs[#addrs + 1] = b.addr .. ":" .. b.port
+        end
+        table.sort(addrs)
+        log_parts[#log_parts + 1] = name .. " -> " .. table.concat(addrs, ", ")
+    end
+    table.sort(log_parts)
+    local snapshot = table.concat(log_parts, " | ")
+
+    if snapshot ~= prev_snapshot then
+        if #log_parts > 0 then
+            ngx.log(ngx.NOTICE, "[discovery] ", snapshot)
+        else
+            ngx.log(ngx.NOTICE, "[discovery] no routable services")
+        end
+        prev_snapshot = snapshot
+    end
 end
 
 function _M.start()
     init_config()
 
-    ngx.log(ngx.NOTICE, "[discovery] consul=", CONSUL_ADDR,
-            " suffix=.", DOMAIN_SUFFIX,
-            " poll=", POLL_INTERVAL, "s",
-            " tags=", os.getenv("FILTER_TAGS") or "web,prometheus")
+    ngx.log(ngx.NOTICE, "[discovery] polling every ", POLL_INTERVAL, "s")
 
     -- initial poll
     local ok, err = ngx.timer.at(0, poll_consul)
@@ -124,7 +151,7 @@ function _M.route()
 
     -- strip domain suffix to get service name
     local suffix = "." .. DOMAIN_SUFFIX
-    if not host:sub(-#suffix) == suffix then
+    if host:sub(-#suffix) ~= suffix then
         return ngx.exit(ngx.HTTP_NOT_FOUND)
     end
 
@@ -136,7 +163,7 @@ function _M.route()
     local routes = ngx.shared.routes
     local data = routes:get(name)
     if not data then
-        ngx.log(ngx.WARN, "[discovery] no route for service: ", name)
+        ngx.log(ngx.WARN, "[discovery] no route: ", name)
         return ngx.exit(ngx.HTTP_SERVICE_UNAVAILABLE)
     end
 
