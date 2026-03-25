@@ -1,0 +1,57 @@
+# Consul auto-discovery -> OpenResty gateway -> /metrics
+#
+# Domain scheme:
+#   <service>.<node>.cen    per-node pinned scrape (preferred)
+#   <service>.cen           load-balanced across all nodes
+#
+# Prerequisites:
+#   1. DNS: all *.cen -> gateway IP (see below)
+#   2. Services registered in Consul with tag 'prometheus'
+#   3. Services expose /metrics (or custom path via Meta.metrics_path)
+#
+# DNS resolution (dnsmasq):
+#   address=/cen/10.0.0.1        # all *.cen -> gateway IP
+#
+#   If you also need <node>.cen -> node IP (for SSH etc.):
+#   CoreDNS with hosts plugin for exact node records + template fallback,
+#   or simply use the node IP directly for non-gateway access.
+#
+# Scrape staggering:
+#   Prometheus computes offset = hash(labels) % scrape_interval per target.
+#   With 15s interval and N targets, scrapes spread evenly across the window.
+#   No extra config needed -- this is built-in behavior.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: consul
+
+    consul_sd_configs:
+      - server: http://127.0.0.1:8500
+        # token: your-consul-acl-token
+        tags:
+          - prometheus
+        # datacenter: dc1
+        # allow_stale: true
+
+    relabel_configs:
+      # target: <service>.<node>.cen:80 (per-node, through gateway)
+      - source_labels: [__meta_consul_service, __meta_consul_node]
+        separator: '.'
+        replacement: '${1}.cen:80'
+        target_label: __address__
+
+      # job = service name
+      - source_labels: [__meta_consul_service]
+        target_label: job
+
+      # preserve node for grouping / filtering
+      - source_labels: [__meta_consul_node]
+        target_label: node
+
+      # optional: custom metrics path via Consul service Meta
+      - source_labels: [__meta_consul_service_metadata_metrics_path]
+        regex: (.+)
+        target_label: __metrics_path__

@@ -7,7 +7,8 @@ SRCS    = registrator.c
 IMAGE   = biteagle/consul-registrator
 VERSION = $(strip $(file < VERSION))
 
-.PHONY: all clean docker push release patch minor major
+.PHONY: all clean docker push release patch minor major \
+       gateway-up gateway-down gateway-reload gateway-rebuild gateway-logs
 
 all: $(TARGET)
 
@@ -46,3 +47,25 @@ major:
 
 # Alias: bump patch + build + push (most common)
 release: patch
+
+# --- OpenResty gateway ---
+
+GATEWAY_DIR = openresty
+
+# Hot reload: pick up lua/nginx.conf changes without restart
+gateway-reload:
+	docker exec consul-gateway nginx -s reload
+
+# Cold restart: recreate container (picks up env/volume changes)
+gateway-down:
+	cd $(GATEWAY_DIR) && docker compose down
+
+gateway-up:
+	cd $(GATEWAY_DIR) && docker compose up -d
+
+# Full rebuild: rebuild image + recreate container
+gateway-rebuild:
+	cd $(GATEWAY_DIR) && docker compose up -d --build
+
+gateway-logs:
+	cd $(GATEWAY_DIR) && docker compose logs -f --tail=50

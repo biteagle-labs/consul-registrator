@@ -4,6 +4,9 @@ services:
     container_name: consul-gateway
     network_mode: host
     restart: always
+    volumes:
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./lua:/usr/local/openresty/nginx/lua:ro
     environment:
       - DOMAIN_SUFFIX=${DOMAIN_SUFFIX:-svc.local}
       - CONSUL_ADDR=${CONSUL_ADDR:-http://127.0.0.1:8500}

@@ -9,7 +9,6 @@ local DOMAIN_SUFFIX
 local POLL_INTERVAL
 local FILTER_TAGS
 
--- state for incremental route updates and change detection
 local prev_names    = {}
 local prev_snapshot = ""
 
@@ -84,8 +83,7 @@ local function poll_consul(premature)
         end
     end
 
-    -- incremental update: set new/updated routes, remove stale ones
-    -- (preserves rr: counters for services that still exist)
+    -- incremental update (preserves rr counters)
     local curr_names = {}
     for name, backends in pairs(table_new) do
         routes:set(name, cjson.encode(backends))
@@ -99,7 +97,7 @@ local function poll_consul(premature)
     end
     prev_names = curr_names
 
-    -- change-only logging: one line per service, format: name.suffix -> ip:port, ip:port
+    -- change-only logging: one line per service
     local log_lines = {}
     for name, backends in pairs(table_new) do
         local addrs = {}
@@ -127,16 +125,13 @@ end
 
 function _M.start()
     init_config()
-
     ngx.log(ngx.NOTICE, "[discovery] polling every ", POLL_INTERVAL, "s")
 
-    -- initial poll
     local ok, err = ngx.timer.at(0, poll_consul)
     if not ok then
         ngx.log(ngx.ERR, "[discovery] failed to start initial poll: ", err)
     end
 
-    -- periodic poll
     local ok2, err2 = ngx.timer.every(POLL_INTERVAL, poll_consul)
     if not ok2 then
         ngx.log(ngx.ERR, "[discovery] failed to start periodic poll: ", err2)
@@ -149,10 +144,8 @@ function _M.route()
         return ngx.exit(ngx.HTTP_BAD_REQUEST)
     end
 
-    -- strip port if present
     host = host:gsub(":%d+$", "")
 
-    -- strip domain suffix to get service name
     local suffix = "." .. DOMAIN_SUFFIX
     if host:sub(-#suffix) ~= suffix then
         return ngx.exit(ngx.HTTP_NOT_FOUND)
