@@ -99,22 +99,25 @@ local function poll_consul(premature)
     end
     prev_names = curr_names
 
-    -- change-only logging: service name -> backend IPs
-    local log_parts = {}
+    -- change-only logging: one line per service, format: name.suffix -> ip:port, ip:port
+    local log_lines = {}
     for name, backends in pairs(table_new) do
         local addrs = {}
         for _, b in ipairs(backends) do
             addrs[#addrs + 1] = b.addr .. ":" .. b.port
         end
         table.sort(addrs)
-        log_parts[#log_parts + 1] = name .. " -> " .. table.concat(addrs, ", ")
+        log_lines[#log_lines + 1] = name .. "." .. DOMAIN_SUFFIX
+            .. " -> " .. table.concat(addrs, ", ")
     end
-    table.sort(log_parts)
-    local snapshot = table.concat(log_parts, " | ")
+    table.sort(log_lines)
+    local snapshot = table.concat(log_lines, "\n")
 
     if snapshot ~= prev_snapshot then
-        if #log_parts > 0 then
-            ngx.log(ngx.NOTICE, "[discovery] ", snapshot)
+        if #log_lines > 0 then
+            for _, line in ipairs(log_lines) do
+                ngx.log(ngx.NOTICE, "[discovery] ", line)
+            end
         else
             ngx.log(ngx.NOTICE, "[discovery] no routable services")
         end
