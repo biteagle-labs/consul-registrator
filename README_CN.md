@@ -10,7 +10,7 @@
 
 - **Opt-in 模式** — 仅设置了 `CONSUL_LISTEN_ENABLE=true` 的容器才会被注册
 - **双通道配置** — 优先读取容器环境变量，其次读取 labels
-- **自动端口检测** — `CONSUL_SERVICE_PORT` > HostPort 端口映射 > EXPOSE；无可检测端口的容器将被跳过
+- **自动端口检测** — `CONSUL_SERVICE_PORT` > HostPort 端口映射 > `expose:` > EXPOSE > per-port labels；无可检测端口的容器将被跳过
 - **TCP 健康检查** — 自动生成 Consul TCP 检查，目标为 `容器IP:容器端口`
 - **智能地址解析** — 有端口映射的容器使用宿主机 IP，bridge/自定义网络容器使用容器 IP
 - **POD_IP 模式** — 强制使用容器 IP + 内部端口注册（支持全局或按端口配置）
@@ -114,8 +114,9 @@ docker run -d -p 8080:80 \
 2. Docker 端口映射（`HostPort`）
 3. `NetworkSettings.Ports` keys（捕获 compose `expose:` 等 Docker 已知端口）
 4. Dockerfile 中的 `EXPOSE` 指令
+5. `CONSUL_SERVICE_<port>_*` labels / 环境变量（per-port labels 隐式声明端口）
 
-无法检测到任何端口的容器将被**跳过**（不注册）。对于没有显式端口声明的 docker-compose 服务，请在 compose 文件中添加 `expose:` 或在 Dockerfile 中添加 `EXPOSE`。
+无法检测到任何端口的容器将被**跳过**（不注册）。对于没有显式端口声明的 docker-compose 服务，可在 compose 文件中添加 `expose:`、在 Dockerfile 中添加 `EXPOSE`，或直接使用 per-port labels（如 `CONSUL_SERVICE_8080_NAME=myapp`）声明端口。
 
 ### 健康检查
 
@@ -215,8 +216,10 @@ register_container(container_id)
  ├─ detect_ports() 端口检测
  │    ├─ 1. CONSUL_SERVICE_PORT → 反查 HostPort 映射
  │    ├─ 2. NetworkSettings.Ports 中的 HostPort 绑定（去重）
- │    ├─ 3. Config.ExposedPorts (EXPOSE)
- │    └─ 4. 无端口 → port_count=0，跳过注册
+ │    ├─ 3. NetworkSettings.Ports keys（expose: 等 Docker 已知端口）
+ │    ├─ 4. Config.ExposedPorts (EXPOSE)
+ │    ├─ 5. CONSUL_SERVICE_<port>_* labels / 环境变量（隐式声明端口）
+ │    └─ 6. 无端口 → port_count=0，跳过注册
  │
  ├─ 门控: port_count == 0 → 跳过 (return 1，仍计入 enabled)
  │

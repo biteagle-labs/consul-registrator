@@ -286,7 +286,7 @@ static void extract_image_name(const char *image, char *out, size_t out_sz)
     out[len] = '\0';
 }
 
-/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > Ports keys > EXPOSE - */
+/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > Ports keys > EXPOSE > per-port labels - */
 
 static void detect_ports(cJSON *inspect, ServiceDef *svc)
 {
@@ -410,10 +410,68 @@ static void detect_ports(cJSON *inspect, ServiceDef *svc)
     }
     if (svc->port_count > 0) return;
 
-    /* 5. No port detected -- leave port_count = 0.
+    /* 5. Scan CONSUL_SERVICE_<PORT>_* labels/env vars to discover ports.
+     *    Per-port labels like CONSUL_SERVICE_8080_NAME implicitly declare
+     *    that port for registration, even without EXPOSE or port mappings. */
+    {
+        cJSON *cfg_obj = cJSON_GetObjectItem(inspect, "Config");
+
+        /* helper: add port if not already present */
+        #define ADD_PORT_IF_NEW(p) do {                                 \
+            int _p = (p);                                               \
+            if (_p > 0 && svc->port_count < MAX_PORTS) {               \
+                int _dup = 0;                                           \
+                for (int _k = 0; _k < svc->port_count; _k++) {         \
+                    if (svc->ports[_k].container_port == _p)            \
+                        { _dup = 1; break; }                            \
+                }                                                       \
+                if (!_dup) {                                            \
+                    svc->ports[svc->port_count].host_port      = _p;   \
+                    svc->ports[svc->port_count].container_port = _p;   \
+                    svc->port_count++;                                  \
+                }                                                       \
+            }                                                           \
+        } while (0)
+
+        /* scan labels for CONSUL_SERVICE_<digits>_<SUFFIX> */
+        cJSON *labels = cJSON_GetObjectItem(cfg_obj, "Labels");
+        if (cJSON_IsObject(labels)) {
+            cJSON *lbl;
+            cJSON_ArrayForEach(lbl, labels) {
+                if (!lbl->string) continue;
+                int port = 0;
+                char suffix[32] = "";
+                if (sscanf(lbl->string, "CONSUL_SERVICE_%d_%31s",
+                           &port, suffix) == 2) {
+                    ADD_PORT_IF_NEW(port);
+                }
+            }
+        }
+
+        /* scan env vars for CONSUL_SERVICE_<digits>_<SUFFIX>=... */
+        cJSON *env_arr = cJSON_GetObjectItem(cfg_obj, "Env");
+        if (cJSON_IsArray(env_arr)) {
+            cJSON *item;
+            cJSON_ArrayForEach(item, env_arr) {
+                const char *s = cJSON_GetStringValue(item);
+                if (!s) continue;
+                int port = 0;
+                char suffix[32] = "";
+                if (sscanf(s, "CONSUL_SERVICE_%d_%31s",
+                           &port, suffix) == 2) {
+                    ADD_PORT_IF_NEW(port);
+                }
+            }
+        }
+
+        #undef ADD_PORT_IF_NEW
+    }
+    if (svc->port_count > 0) return;
+
+    /* 6. No port detected -- leave port_count = 0.
      * Services without any port (no CONSUL_SERVICE_PORT, no HostPort mapping,
-     * no EXPOSE) should not be registered with Consul, as a fabricated default
-     * port would create a health check that always fails. */
+     * no EXPOSE, no per-port labels) should not be registered with Consul,
+     * as a fabricated default port would create a health check that always fails. */
 }
 
 /* -- Comma-separated tags -> JSON array string ---------------------------- */
@@ -632,7 +690,8 @@ static int register_container(const char *container_id, const Config *cfg)
     detect_ports(inspect, &svc);
 
     /* Skip registration if no port was detected -- the container does not
-     * expose any port (no CONSUL_SERVICE_PORT, no HostPort, no EXPOSE).
+     * expose any port (no CONSUL_SERVICE_PORT, no HostPort, no EXPOSE,
+     * no per-port labels).
      * Registering it would create a health check on a fabricated port. */
     if (svc.port_count == 0) {
         log_debug("Skipping %s (%.12s): no port detected, service not registered",

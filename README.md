@@ -10,7 +10,7 @@ Built on Alpine Linux with libcurl and cJSON. Single binary, minimal footprint.
 
 - **Opt-in mode** — only containers with `CONSUL_LISTEN_ENABLE=true` are registered
 - **Dual-channel config** — reads from container environment variables first, then labels
-- **Auto port detection** — `CONSUL_SERVICE_PORT` > HostPort mapping > EXPOSE; containers with no detectable port are skipped
+- **Auto port detection** — `CONSUL_SERVICE_PORT` > HostPort mapping > `expose:` > EXPOSE > per-port labels; containers with no detectable port are skipped
 - **TCP health check** — auto-generates a Consul TCP check targeting `container_ip:container_port`
 - **Smart address resolution** — uses host IP for port-mapped containers, container IP for bridge/custom networks
 - **POD_IP mode** — force registration with container IP + internal port (global or per-port)
@@ -114,8 +114,9 @@ Set via container environment variables (`-e`) or labels (`-l`). Environment var
 2. Docker port mapping (`HostPort`)
 3. `NetworkSettings.Ports` keys (catches compose `expose:` and other Docker-known ports)
 4. `EXPOSE` directive from Dockerfile
+5. `CONSUL_SERVICE_<port>_*` labels / env vars (per-port labels implicitly declare ports)
 
-Containers with no detectable port are **skipped** (not registered). For docker-compose services without explicit port declarations, add `expose:` in the compose file or `EXPOSE` in the Dockerfile.
+Containers with no detectable port are **skipped** (not registered). For docker-compose services without explicit port declarations, you can add `expose:` in the compose file, `EXPOSE` in the Dockerfile, or use per-port labels like `CONSUL_SERVICE_8080_NAME=myapp` to declare ports directly.
 
 ### Health Check
 
@@ -215,8 +216,10 @@ register_container(container_id)
  ├─ detect_ports()
  │    ├─ 1. CONSUL_SERVICE_PORT → look up HostPort mapping
  │    ├─ 2. NetworkSettings.Ports HostPort bindings (deduplicated)
- │    ├─ 3. Config.ExposedPorts (EXPOSE)
- │    └─ 4. No port found → port_count=0, skip registration
+ │    ├─ 3. NetworkSettings.Ports keys (expose: / Docker-known ports)
+ │    ├─ 4. Config.ExposedPorts (EXPOSE)
+ │    ├─ 5. CONSUL_SERVICE_<port>_* labels/env vars (implicit port declaration)
+ │    └─ 6. No port found → port_count=0, skip registration
  │
  ├─ Gate: port_count == 0 → skip (return 1, still counts as enabled)
  │
