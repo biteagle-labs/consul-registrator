@@ -184,34 +184,85 @@ get_container_ip() {
     fi
 }
 
-# --- Detect ports ---
-# Priority: CONSUL_SERVICE_PORT > HostPort mapping > EXPOSE
+# --- Collect explicitly declared per-port services ---
 # Returns JSON array: [{"host_port": N, "container_port": N, "host_mapped": bool}, ...]
-detect_ports() {
+collect_declared_ports() {
+    local inspect_json="$1"
+
+    echo "$inspect_json" | jq '
+        def declared_keys:
+            [
+                (.Config.Labels // {} | keys[]?),
+                (.Config.Env // [] | .[] | split("=")[0])
+            ];
+        def mapped_host_port($cp):
+            [
+                (.NetworkSettings.Ports // {}) | to_entries[] |
+                select((.key | split("/")[0] | tonumber) == $cp) |
+                (.value // [])[] |
+                .HostPort |
+                select(. != null and . != "") |
+                tonumber
+            ] | min;
+
+        declared_keys
+        | map(
+            select(test("^CONSUL_SERVICE_[0-9]+_.+$")) |
+            capture("^CONSUL_SERVICE_(?<port>[0-9]+)_.+$").port |
+            tonumber
+        )
+        | unique
+        | sort
+        | map(
+            . as $cp |
+            (mapped_host_port($cp)) as $hp |
+            {
+                host_port: ($hp // $cp),
+                container_port: $cp,
+                host_mapped: ($hp != null)
+            }
+        )' 2>/dev/null
+}
+
+# --- Detect a single default port ---
+# Priority: CONSUL_SERVICE_PORT > smallest HostPort-mapped container port >
+# smallest NetworkSettings.Ports key > smallest EXPOSE port
+# Returns JSON object: {"host_port": N, "container_port": N, "host_mapped": bool}
+detect_default_port() {
     local inspect_json="$1"
 
     # 1. Manual port override (CONSUL_SERVICE_PORT = internal/container port)
     local manual_port
     manual_port=$(get_container_config "$inspect_json" "CONSUL_SERVICE_PORT" "")
     if [ -n "$manual_port" ]; then
+        case "$manual_port" in
+            ''|*[!0-9]*)
+                echo ""
+                return
+                ;;
+        esac
+
         # Look up corresponding HostPort for this internal port
-        local host_port host_mapped
+        local host_port
         host_port=$(echo "$inspect_json" | jq -r --arg cp "$manual_port" '
-            .NetworkSettings.Ports // {} | to_entries[] |
-            select(.key | startswith($cp + "/")) |
-            .value // [] | .[] |
-            select(.HostPort != null and .HostPort != "") |
-            .HostPort' 2>/dev/null | head -1)
+            [
+                (.NetworkSettings.Ports // {}) | to_entries[] |
+                select(.key | startswith($cp + "/")) |
+                (.value // [])[] |
+                .HostPort |
+                select(. != null and . != "") |
+                tonumber
+            ] | min // empty' 2>/dev/null)
 
         if [ -n "$host_port" ]; then
-            echo "[{\"host_port\":$host_port,\"container_port\":$manual_port,\"host_mapped\":true}]"
+            echo "{\"host_port\":$host_port,\"container_port\":$manual_port,\"host_mapped\":true}"
         else
-            echo "[{\"host_port\":$manual_port,\"container_port\":$manual_port,\"host_mapped\":false}]"
+            echo "{\"host_port\":$manual_port,\"container_port\":$manual_port,\"host_mapped\":false}"
         fi
         return
     fi
 
-    # 2. Port mappings (HostPort) -- deduplicate
+    # 2. Port mappings (HostPort) -- choose the smallest container port
     local mapped
     mapped=$(echo "$inspect_json" | jq '
         [.NetworkSettings.Ports // {} | to_entries[] |
@@ -221,38 +272,41 @@ detect_ports() {
          select(.bindings | length > 0) |
          .bindings[] as $hp |
          {host_port: $hp, container_port: .container_port, host_mapped: true}
-        ] | unique_by(.host_port)' 2>/dev/null)
+        ] | sort_by(.container_port, .host_port) | .[0] // empty' 2>/dev/null)
 
-    if [ -n "$mapped" ] && [ "$mapped" != "[]" ]; then
+    if [ -n "$mapped" ] && [ "$mapped" != "null" ]; then
         echo "$mapped"
         return
     fi
 
-    # 3. NetworkSettings.Ports keys (ports known to Docker but not host-mapped,
-    #    e.g. compose "expose:" or compose network ports with null bindings)
-    local ports_keys
-    ports_keys=$(echo "$inspect_json" | jq '
-        [.NetworkSettings.Ports // {} | keys[] | split("/")[0] | tonumber] | unique |
-        [.[] | {host_port: ., container_port: ., host_mapped: false}]' 2>/dev/null)
+    # 3. NetworkSettings.Ports keys -- choose the smallest known port
+    local port_key
+    port_key=$(echo "$inspect_json" | jq '
+        ([.NetworkSettings.Ports // {} | keys[] | split("/")[0] | tonumber] | min) as $port |
+        if $port == null then empty
+        else {host_port: $port, container_port: $port, host_mapped: false}
+        end' 2>/dev/null)
 
-    if [ -n "$ports_keys" ] && [ "$ports_keys" != "[]" ]; then
-        echo "$ports_keys"
+    if [ -n "$port_key" ] && [ "$port_key" != "null" ]; then
+        echo "$port_key"
         return
     fi
 
-    # 4. EXPOSE ports from Dockerfile (Config.ExposedPorts)
+    # 4. EXPOSE ports from Dockerfile -- choose the smallest exposed port
     local exposed
     exposed=$(echo "$inspect_json" | jq '
-        [.Config.ExposedPorts // {} | keys[] | split("/")[0] | tonumber] | unique |
-        [.[] | {host_port: ., container_port: ., host_mapped: false}]' 2>/dev/null)
+        ([.Config.ExposedPorts // {} | keys[] | split("/")[0] | tonumber] | min) as $port |
+        if $port == null then empty
+        else {host_port: $port, container_port: $port, host_mapped: false}
+        end' 2>/dev/null)
 
-    if [ -n "$exposed" ] && [ "$exposed" != "[]" ]; then
+    if [ -n "$exposed" ] && [ "$exposed" != "null" ]; then
         echo "$exposed"
         return
     fi
 
-    # 5. No port detected
-    echo "[]"
+    # 5. No default port detected
+    echo ""
 }
 
 # --- Register a single container ---
@@ -297,14 +351,41 @@ register_container() {
         service_tags=$(echo "$service_tags_str" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
     fi
 
-    # Get port list (JSON array)
-    local ports_json
-    ports_json=$(detect_ports "$inspect_json")
+    # Build merged port list:
+    # 1. Explicit CONSUL_SERVICE_<port>_* declarations always register that port
+    # 2. Auto-detection contributes at most one default port
+    local declared_ports default_port ports_json
+    declared_ports=$(collect_declared_ports "$inspect_json")
+    if [ -z "$declared_ports" ]; then
+        declared_ports="[]"
+    fi
+    default_port=$(detect_default_port "$inspect_json")
+    if [ -z "$default_port" ]; then
+        default_port="null"
+    fi
+
+    ports_json=$(jq -n \
+        --argjson declared "$declared_ports" \
+        --argjson default "$default_port" '
+        ($declared // []) as $declared |
+        if $default == null then
+            $declared
+        elif any($declared[]?; .container_port == $default.container_port) then
+            $declared | map(
+                if .container_port == $default.container_port then
+                    .host_port = (if $default.host_mapped then $default.host_port else .host_port end) |
+                    .host_mapped = (.host_mapped or $default.host_mapped)
+                else . end
+            )
+        else
+            $declared + [$default]
+        end
+        | sort_by(.container_port, .host_port)')
 
     local port_count
     port_count=$(echo "$ports_json" | jq 'length')
 
-    # Skip registration if no port was detected
+    # Skip registration if no port was selected or declared
     if [ "$port_count" -eq 0 ]; then
         log_debug "Skipping $container_name ($container_id): no port detected, service not registered"
         return 0  # still enabled, just no port

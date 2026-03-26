@@ -48,6 +48,7 @@ typedef struct {
 typedef struct {
     int  host_port;       /* port for Consul registration (external access) */
     int  container_port;  /* internal container port (for label/env key lookup) */
+    int  host_mapped;     /* 1 = container port has a HostPort mapping */
 } PortEntry;
 
 typedef struct {
@@ -55,7 +56,6 @@ typedef struct {
     char      container_name[128];
     PortEntry ports[MAX_PORTS];
     int       port_count;
-    int       host_mapped;    /* 1 = ports from HostPort mapping, use host IP */
 } ServiceDef;
 
 typedef struct {
@@ -123,6 +123,17 @@ static int buf_append(Buffer *b, const char *data, size_t n)
     b->len += n;
     b->data[b->len] = '\0';
     return 0;
+}
+
+static void copy_cstr(char *dst, size_t dst_sz, const char *src)
+{
+    if (!dst || dst_sz == 0) return;
+    if (!src) src = "";
+
+    size_t n = strlen(src);
+    if (n >= dst_sz) n = dst_sz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
 }
 
 /* -- Logging -------------------------------------------------------------- */
@@ -286,12 +297,122 @@ static void extract_image_name(const char *image, char *out, size_t out_sz)
     out[len] = '\0';
 }
 
-/* -- Port detection: CONSUL_SERVICE_PORT > HostPort > Ports keys > EXPOSE > per-port labels - */
-
-static void detect_ports(cJSON *inspect, ServiceDef *svc)
+static void add_or_update_port(ServiceDef *svc, int container_port,
+                               int host_port, int host_mapped)
 {
-    svc->port_count  = 0;
-    svc->host_mapped = 0;
+    if (container_port <= 0) return;
+
+    for (int i = 0; i < svc->port_count; i++) {
+        if (svc->ports[i].container_port != container_port) continue;
+
+        if (host_mapped &&
+            (!svc->ports[i].host_mapped || host_port > 0)) {
+            svc->ports[i].host_port   = host_port > 0 ? host_port : container_port;
+            svc->ports[i].host_mapped = 1;
+        }
+        return;
+    }
+
+    if (svc->port_count >= MAX_PORTS) return;
+
+    svc->ports[svc->port_count].container_port = container_port;
+    svc->ports[svc->port_count].host_port      = host_port > 0 ? host_port : container_port;
+    svc->ports[svc->port_count].host_mapped    = host_mapped ? 1 : 0;
+    svc->port_count++;
+}
+
+static int find_host_mapping_for_port(cJSON *ports_obj, int internal_port, int *host_port_out)
+{
+    if (!cJSON_IsObject(ports_obj) || internal_port <= 0) return 0;
+
+    int best_host_port = 0;
+
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, ports_obj) {
+        if (!entry->string || !cJSON_IsArray(entry)) continue;
+        if (atoi(entry->string) != internal_port) continue;
+
+        cJSON *binding;
+        cJSON_ArrayForEach(binding, entry) {
+            cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
+            const char *hp_str = cJSON_GetStringValue(hp);
+            if (!hp_str || !hp_str[0]) continue;
+
+            int hp_val = atoi(hp_str);
+            if (hp_val <= 0) continue;
+            if (best_host_port == 0 || hp_val < best_host_port)
+                best_host_port = hp_val;
+        }
+        break;
+    }
+
+    if (best_host_port <= 0) return 0;
+    if (host_port_out) *host_port_out = best_host_port;
+    return 1;
+}
+
+static int parse_declared_port_key(const char *key, int *port_out)
+{
+    const char *prefix = "CONSUL_SERVICE_";
+    size_t      plen   = strlen(prefix);
+
+    if (!key || strncmp(key, prefix, plen) != 0) return 0;
+
+    const char *p = key + plen;
+    if (*p < '0' || *p > '9') return 0;
+
+    int port = 0;
+    while (*p >= '0' && *p <= '9') {
+        port = port * 10 + (*p - '0');
+        p++;
+    }
+
+    if (port <= 0 || *p != '_') return 0;
+    p++;
+
+    if (!*p) return 0;
+    if (port_out) *port_out = port;
+    return 1;
+}
+
+static void collect_declared_ports(cJSON *inspect, ServiceDef *svc)
+{
+    cJSON *cfg_obj   = cJSON_GetObjectItem(inspect, "Config");
+    cJSON *netset    = cJSON_GetObjectItem(inspect, "NetworkSettings");
+    cJSON *ports_obj = cJSON_GetObjectItem(netset, "Ports");
+
+    /* Explicit per-port config always declares that container port. */
+    cJSON *labels = cJSON_GetObjectItem(cfg_obj, "Labels");
+    if (cJSON_IsObject(labels)) {
+        cJSON *lbl;
+        cJSON_ArrayForEach(lbl, labels) {
+            int port = 0;
+            if (!parse_declared_port_key(lbl->string, &port)) continue;
+
+            int host_port   = port;
+            int host_mapped = find_host_mapping_for_port(ports_obj, port, &host_port);
+            add_or_update_port(svc, port, host_port, host_mapped);
+        }
+    }
+
+    cJSON *env_arr = cJSON_GetObjectItem(cfg_obj, "Env");
+    if (cJSON_IsArray(env_arr)) {
+        cJSON *item;
+        cJSON_ArrayForEach(item, env_arr) {
+            const char *s = cJSON_GetStringValue(item);
+            int         port = 0;
+            if (!parse_declared_port_key(s, &port)) continue;
+
+            int host_port   = port;
+            int host_mapped = find_host_mapping_for_port(ports_obj, port, &host_port);
+            add_or_update_port(svc, port, host_port, host_mapped);
+        }
+    }
+}
+
+static int detect_default_port(cJSON *inspect, PortEntry *port)
+{
+    memset(port, 0, sizeof(*port));
 
     /* helper: port mappings object from NetworkSettings */
     cJSON *netset    = cJSON_GetObjectItem(inspect, "NetworkSettings");
@@ -302,176 +423,115 @@ static void detect_ports(cJSON *inspect, ServiceDef *svc)
     if (manual && manual[0]) {
         int internal_port = atoi(manual);
         if (internal_port > 0) {
-            int host_port     = internal_port;   /* default: same as internal */
-            int found_mapping = 0;
-
-            /* look up corresponding HostPort for this internal port */
-            if (cJSON_IsObject(ports_obj)) {
-                cJSON *entry;
-                cJSON_ArrayForEach(entry, ports_obj) {
-                    if (!entry->string) continue;
-                    int cp = atoi(entry->string);    /* e.g. "3000/tcp" -> 3000 */
-                    if (cp == internal_port && cJSON_IsArray(entry)) {
-                        cJSON *binding;
-                        cJSON_ArrayForEach(binding, entry) {
-                            cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
-                            const char *hp_str = cJSON_GetStringValue(hp);
-                            if (hp_str && hp_str[0]) {
-                                int hp_val = atoi(hp_str);
-                                if (hp_val > 0) {
-                                    host_port     = hp_val;
-                                    found_mapping = 1;
-                                    break;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-
-            svc->ports[0].host_port      = host_port;
-            svc->ports[0].container_port = internal_port;
-            svc->port_count              = 1;
-            svc->host_mapped             = found_mapping;
+            int host_port   = internal_port;
+            int host_mapped = find_host_mapping_for_port(ports_obj, internal_port, &host_port);
+            port->host_port      = host_port;
+            port->container_port = internal_port;
+            port->host_mapped    = host_mapped;
+            return 1;
         }
-        return;
+        return 0;
     }
 
-    /* 2. Port mapping HostPort (deduplicate: IPv4 + IPv6 binding same port counted once) */
+    /* 2. Port mapping HostPort: choose the smallest exposed container port as default. */
     if (cJSON_IsObject(ports_obj)) {
+        int best_container_port = 0;
+        int best_host_port      = 0;
+
         cJSON *entry;
         cJSON_ArrayForEach(entry, ports_obj) {
             if (!cJSON_IsArray(entry)) continue;
             int container_port = entry->string ? atoi(entry->string) : 0;
+            if (container_port <= 0) continue;
+
             cJSON *binding;
             cJSON_ArrayForEach(binding, entry) {
                 cJSON      *hp     = cJSON_GetObjectItem(binding, "HostPort");
                 const char *hp_str = cJSON_GetStringValue(hp);
                 if (!hp_str || !hp_str[0]) continue;
                 int host_port = atoi(hp_str);
-                if (host_port <= 0 || svc->port_count >= MAX_PORTS) continue;
-                /* check for duplicates by host port */
-                int dup = 0;
-                for (int k = 0; k < svc->port_count; k++) {
-                    if (svc->ports[k].host_port == host_port) { dup = 1; break; }
-                }
-                if (!dup) {
-                    svc->ports[svc->port_count].host_port      = host_port;
-                    svc->ports[svc->port_count].container_port = container_port > 0 ? container_port : host_port;
-                    svc->port_count++;
+                if (host_port <= 0) continue;
+
+                if (best_container_port == 0 ||
+                    container_port < best_container_port ||
+                    (container_port == best_container_port &&
+                     (best_host_port == 0 || host_port < best_host_port))) {
+                    best_container_port = container_port;
+                    best_host_port      = host_port;
                 }
             }
         }
-    }
-    if (svc->port_count > 0) {
-        svc->host_mapped = 1;
-        return;
+        if (best_container_port > 0) {
+            port->host_port      = best_host_port;
+            port->container_port = best_container_port;
+            port->host_mapped    = 1;
+            return 1;
+        }
     }
 
-    /* 3. NetworkSettings.Ports keys (ports known to Docker but not host-mapped,
-     *    e.g. compose "expose:" or compose network ports with null bindings) */
+    /* 3. NetworkSettings.Ports keys: choose the smallest known container port. */
     if (cJSON_IsObject(ports_obj)) {
+        int best_port = 0;
+
         cJSON *entry;
         cJSON_ArrayForEach(entry, ports_obj) {
-            if (entry->string && svc->port_count < MAX_PORTS) {
+            if (entry->string) {
                 int port = atoi(entry->string);
-                if (port > 0) {
-                    int dup = 0;
-                    for (int k = 0; k < svc->port_count; k++) {
-                        if (svc->ports[k].container_port == port) { dup = 1; break; }
-                    }
-                    if (!dup) {
-                        svc->ports[svc->port_count].host_port      = port;
-                        svc->ports[svc->port_count].container_port = port;
-                        svc->port_count++;
-                    }
-                }
+                if (port > 0 && (best_port == 0 || port < best_port))
+                    best_port = port;
             }
         }
+        if (best_port > 0) {
+            port->host_port      = best_port;
+            port->container_port = best_port;
+            port->host_mapped    = 0;
+            return 1;
+        }
     }
-    if (svc->port_count > 0) return;
 
-    /* 4. EXPOSE from Dockerfile (Config.ExposedPorts) */
+    /* 4. EXPOSE from Dockerfile: choose the smallest exposed container port. */
     cJSON *config  = cJSON_GetObjectItem(inspect, "Config");
     cJSON *exposed = cJSON_GetObjectItem(config, "ExposedPorts");
     if (cJSON_IsObject(exposed)) {
+        int best_port = 0;
+
         cJSON *ep;
         cJSON_ArrayForEach(ep, exposed) {
-            if (ep->string && svc->port_count < MAX_PORTS) {
+            if (ep->string) {
                 int port = atoi(ep->string);
-                if (port > 0) {
-                    svc->ports[svc->port_count].host_port      = port;
-                    svc->ports[svc->port_count].container_port = port;
-                    svc->port_count++;
-                }
+                if (port > 0 && (best_port == 0 || port < best_port))
+                    best_port = port;
             }
+        }
+        if (best_port > 0) {
+            port->host_port      = best_port;
+            port->container_port = best_port;
+            port->host_mapped    = 0;
+            return 1;
         }
     }
-    if (svc->port_count > 0) return;
 
-    /* 5. Scan CONSUL_SERVICE_<PORT>_* labels/env vars to discover ports.
-     *    Per-port labels like CONSUL_SERVICE_8080_NAME implicitly declare
-     *    that port for registration, even without EXPOSE or port mappings. */
-    {
-        cJSON *cfg_obj = cJSON_GetObjectItem(inspect, "Config");
+    /* 5. No default port detected. Explicit per-port declarations are collected
+     *    separately, so containers can still register services without EXPOSE or
+     *    Docker-reported ports when they define CONSUL_SERVICE_<port>_* keys. */
+    return 0;
+}
 
-        /* helper: add port if not already present */
-        #define ADD_PORT_IF_NEW(p) do {                                 \
-            int _p = (p);                                               \
-            if (_p > 0 && svc->port_count < MAX_PORTS) {               \
-                int _dup = 0;                                           \
-                for (int _k = 0; _k < svc->port_count; _k++) {         \
-                    if (svc->ports[_k].container_port == _p)            \
-                        { _dup = 1; break; }                            \
-                }                                                       \
-                if (!_dup) {                                            \
-                    svc->ports[svc->port_count].host_port      = _p;   \
-                    svc->ports[svc->port_count].container_port = _p;   \
-                    svc->port_count++;                                  \
-                }                                                       \
-            }                                                           \
-        } while (0)
+static int compare_port_entries(const void *a, const void *b)
+{
+    const PortEntry *pa = (const PortEntry *)a;
+    const PortEntry *pb = (const PortEntry *)b;
+    if (pa->container_port != pb->container_port)
+        return pa->container_port - pb->container_port;
+    return pa->host_port - pb->host_port;
+}
 
-        /* scan labels for CONSUL_SERVICE_<digits>_<SUFFIX> */
-        cJSON *labels = cJSON_GetObjectItem(cfg_obj, "Labels");
-        if (cJSON_IsObject(labels)) {
-            cJSON *lbl;
-            cJSON_ArrayForEach(lbl, labels) {
-                if (!lbl->string) continue;
-                int port = 0;
-                char suffix[32] = "";
-                if (sscanf(lbl->string, "CONSUL_SERVICE_%d_%31s",
-                           &port, suffix) == 2) {
-                    ADD_PORT_IF_NEW(port);
-                }
-            }
-        }
-
-        /* scan env vars for CONSUL_SERVICE_<digits>_<SUFFIX>=... */
-        cJSON *env_arr = cJSON_GetObjectItem(cfg_obj, "Env");
-        if (cJSON_IsArray(env_arr)) {
-            cJSON *item;
-            cJSON_ArrayForEach(item, env_arr) {
-                const char *s = cJSON_GetStringValue(item);
-                if (!s) continue;
-                int port = 0;
-                char suffix[32] = "";
-                if (sscanf(s, "CONSUL_SERVICE_%d_%31s",
-                           &port, suffix) == 2) {
-                    ADD_PORT_IF_NEW(port);
-                }
-            }
-        }
-
-        #undef ADD_PORT_IF_NEW
+static void sort_ports(ServiceDef *svc)
+{
+    if (svc->port_count > 1) {
+        qsort(svc->ports, (size_t)svc->port_count, sizeof(svc->ports[0]),
+              compare_port_entries);
     }
-    if (svc->port_count > 0) return;
-
-    /* 6. No port detected -- leave port_count = 0.
-     * Services without any port (no CONSUL_SERVICE_PORT, no HostPort mapping,
-     * no EXPOSE, no per-port labels) should not be registered with Consul,
-     * as a fabricated default port would create a health check that always fails. */
 }
 
 /* -- Comma-separated tags -> JSON array string ---------------------------- */
@@ -484,8 +544,7 @@ static void tags_to_json(const char *tags_str, char *out, size_t out_sz)
     }
     cJSON *arr = cJSON_CreateArray();
     char   tmp[512];
-    strncpy(tmp, tags_str, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    copy_cstr(tmp, sizeof(tmp), tags_str);
 
     char *saveptr = NULL;
     char *tok = strtok_r(tmp, ",", &saveptr);
@@ -545,7 +604,7 @@ static void resolve_host_ip(Config *cfg)
     /* 1. Explicit env var override */
     const char *adv = getenv("ADVERTISE_ADDR");
     if (adv && adv[0]) {
-        strncpy(cfg->host_ip, adv, sizeof(cfg->host_ip) - 1);
+        copy_cstr(cfg->host_ip, sizeof(cfg->host_ip), adv);
         return;
     }
 
@@ -560,7 +619,7 @@ static void resolve_host_ip(Config *cfg)
         inet_ntop(AF_INET, &addr->sin_addr, tmp, sizeof(tmp));
         freeaddrinfo(res);
         if (strncmp(tmp, "127.", 4) != 0) {
-            strncpy(cfg->host_ip, tmp, sizeof(cfg->host_ip) - 1);
+            copy_cstr(cfg->host_ip, sizeof(cfg->host_ip), tmp);
             return;
         }
     } else if (res) {
@@ -572,7 +631,7 @@ static void resolve_host_ip(Config *cfg)
         return;
 
     /* 4. Fallback to hostname (old behavior) */
-    strncpy(cfg->host_ip, cfg->hostname, sizeof(cfg->host_ip) - 1);
+    copy_cstr(cfg->host_ip, sizeof(cfg->host_ip), cfg->hostname);
 }
 
 /* -- Extract container IP from inspect JSON -------------------------------- */
@@ -587,7 +646,7 @@ static void get_container_ip(cJSON *inspect, char *ip_buf, size_t ip_buf_sz)
     cJSON      *ip_j = cJSON_GetObjectItem(netset, "IPAddress");
     const char *ip   = cJSON_GetStringValue(ip_j);
     if (ip && ip[0]) {
-        strncpy(ip_buf, ip, ip_buf_sz - 1);
+        copy_cstr(ip_buf, ip_buf_sz, ip);
         return;
     }
 
@@ -599,7 +658,7 @@ static void get_container_ip(cJSON *inspect, char *ip_buf, size_t ip_buf_sz)
             cJSON      *net_ip_j = cJSON_GetObjectItem(net, "IPAddress");
             const char *net_ip   = cJSON_GetStringValue(net_ip_j);
             if (net_ip && net_ip[0]) {
-                strncpy(ip_buf, net_ip, ip_buf_sz - 1);
+                copy_cstr(ip_buf, ip_buf_sz, net_ip);
                 return;
             }
         }
@@ -617,8 +676,8 @@ static int track_register(const char *service_id)
         if (strcmp(g_tracked[i], service_id) == 0) { is_new = 0; break; }
     }
     if (is_new && g_tracked_count < MAX_TRACKED) {
-        strncpy(g_tracked[g_tracked_count], service_id, 255);
-        g_tracked[g_tracked_count][255] = '\0';
+        copy_cstr(g_tracked[g_tracked_count],
+                  sizeof(g_tracked[g_tracked_count]), service_id);
         g_tracked_count++;
     }
     pthread_mutex_unlock(&g_tracked_mutex);
@@ -685,13 +744,20 @@ static int register_container(const char *container_id, const Config *cfg)
 
     ServiceDef svc;
     memset(&svc, 0, sizeof(svc));
-    strncpy(svc.container_id,   container_id,   sizeof(svc.container_id) - 1);
-    strncpy(svc.container_name, container_name, sizeof(svc.container_name) - 1);
-    detect_ports(inspect, &svc);
+    copy_cstr(svc.container_id, sizeof(svc.container_id), container_id);
+    copy_cstr(svc.container_name, sizeof(svc.container_name), container_name);
+    collect_declared_ports(inspect, &svc);
 
-    /* Skip registration if no port was detected -- the container does not
-     * expose any port (no CONSUL_SERVICE_PORT, no HostPort, no EXPOSE,
-     * no per-port labels).
+    PortEntry default_port;
+    if (detect_default_port(inspect, &default_port)) {
+        add_or_update_port(&svc, default_port.container_port,
+                           default_port.host_port, default_port.host_mapped);
+    }
+    sort_ports(&svc);
+
+    /* Skip registration if no port was selected or declared.
+     * Auto-detection contributes at most one default port; additional ports
+     * must come from explicit CONSUL_SERVICE_<port>_* declarations.
      * Registering it would create a health check on a fabricated port. */
     if (svc.port_count == 0) {
         log_debug("Skipping %s (%.12s): no port detected, service not registered",
@@ -715,8 +781,9 @@ static int register_container(const char *container_id, const Config *cfg)
                   container_name);
 
     for (int i = 0; i < svc.port_count; i++) {
-        int port  = svc.ports[i].host_port;       /* for Consul registration */
-        int cport = svc.ports[i].container_port;   /* for label/env key lookup */
+        int port        = svc.ports[i].host_port;       /* for Consul registration */
+        int cport       = svc.ports[i].container_port;  /* for label/env key lookup */
+        int host_mapped = svc.ports[i].host_mapped;
 
         /* per-port override: labels/env port keys always refer to internal port */
         char key_name[64], key_tags_k[64], key_pod_ip[64];
@@ -746,7 +813,7 @@ static int register_container(const char *container_id, const Config *cfg)
         } else if (use_pod_ip) {
             svc_addr = container_ip;
             reg_port = cport;
-        } else if (svc.host_mapped) {
+        } else if (host_mapped) {
             svc_addr = cfg->host_ip;
             reg_port = port;
         } else {
@@ -985,11 +1052,10 @@ static void enqueue_event(const char *action, const char *container_id,
 {
     QEvent *ev = calloc(1, sizeof(QEvent));
     if (!ev) return;
-    strncpy(ev->action,         action,         sizeof(ev->action) - 1);
-    strncpy(ev->container_id,   container_id,   sizeof(ev->container_id) - 1);
-    strncpy(ev->container_name,
-            container_name ? container_name : "",
-            sizeof(ev->container_name) - 1);
+    copy_cstr(ev->action, sizeof(ev->action), action);
+    copy_cstr(ev->container_id, sizeof(ev->container_id), container_id);
+    copy_cstr(ev->container_name, sizeof(ev->container_name),
+              container_name ? container_name : "");
 
     pthread_mutex_lock(&g_eq_mutex);
     if (g_eq_tail) { g_eq_tail->next = ev; g_eq_tail = ev; }
@@ -1202,23 +1268,24 @@ int main(void)
     memset(&cfg, 0, sizeof(cfg));
 
     v = getenv("CONSUL_ADDR");
-    strncpy(cfg.consul_addr, v ? v : DEFAULT_CONSUL_ADDR,
-            sizeof(cfg.consul_addr) - 1);
+    copy_cstr(cfg.consul_addr, sizeof(cfg.consul_addr),
+              v ? v : DEFAULT_CONSUL_ADDR);
 
     v = getenv("REGISTRATOR_TOKEN");
-    if (v) strncpy(cfg.consul_token, v, sizeof(cfg.consul_token) - 1);
+    if (v) copy_cstr(cfg.consul_token, sizeof(cfg.consul_token), v);
 
     v = getenv("DOCKER_SOCK");
-    strncpy(cfg.docker_sock, v ? v : DEFAULT_DOCKER_SOCK,
-            sizeof(cfg.docker_sock) - 1);
+    copy_cstr(cfg.docker_sock, sizeof(cfg.docker_sock),
+              v ? v : DEFAULT_DOCKER_SOCK);
 
     v = getenv("RESYNC_INTERVAL");
     cfg.resync_interval = v ? atoi(v) : DEFAULT_RESYNC_INTERVAL;
     if (cfg.resync_interval <= 0) cfg.resync_interval = DEFAULT_RESYNC_INTERVAL;
 
     gethostname(cfg.hostname, sizeof(cfg.hostname) - 1);
+    cfg.hostname[sizeof(cfg.hostname) - 1] = '\0';
     v = getenv("HOSTNAME_OVERRIDE");
-    if (v) strncpy(cfg.hostname, v, sizeof(cfg.hostname) - 1);
+    if (v) copy_cstr(cfg.hostname, sizeof(cfg.hostname), v);
 
     resolve_host_ip(&cfg);
 

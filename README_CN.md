@@ -10,11 +10,11 @@
 
 - **Opt-in 模式** — 仅设置了 `CONSUL_LISTEN_ENABLE=true` 的容器才会被注册
 - **双通道配置** — 优先读取容器环境变量，其次读取 labels
-- **自动端口检测** — `CONSUL_SERVICE_PORT` > HostPort 端口映射 > `expose:` > EXPOSE > per-port labels；无可检测端口的容器将被跳过
+- **自动默认端口选择** — `CONSUL_SERVICE_PORT` > 最小 HostPort 映射容器端口 > 最小 Docker 已知端口 > 最小 EXPOSE 端口
 - **TCP 健康检查** — 自动生成 Consul TCP 检查，目标为 `容器IP:容器端口`
 - **智能地址解析** — 有端口映射的容器使用宿主机 IP，bridge/自定义网络容器使用容器 IP
 - **POD_IP 模式** — 强制使用容器 IP + 内部端口注册（支持全局或按端口配置）
-- **按端口配置服务** — 通过 `CONSUL_SERVICE_<port>_NAME` 为每个容器注册多个服务
+- **按端口配置服务** — 显式声明的 `CONSUL_SERVICE_<port>_*` 端口始终会与默认端口合并注册
 - **变更日志** — 全量同步时仅在状态变化时输出日志，减少噪音
 - **定时全量同步** — 按间隔全量同步，捕获遗漏事件并清理孤立服务
 - **三线程架构** — 事件流 + 事件处理器 + 全量同步，互不阻塞
@@ -104,19 +104,24 @@ docker run -d -p 8080:80 \
 | `CONSUL_SERVICE_PORT` | 覆盖自动检测的端口（内部/容器端口） | 自动检测 |
 | `CONSUL_SERVICE_CHECK_INTERVAL` | TCP 健康检查间隔 | `10s` |
 | `CONSUL_SERVICE_POD_IP` | 设为 `false` 则对端口映射容器使用宿主机 IP + 宿主机端口 | `true` |
-| `CONSUL_SERVICE_<port>_NAME` | 指定端口的服务名 | 同上 |
-| `CONSUL_SERVICE_<port>_TAGS` | 指定端口的标签 | 同上 |
-| `CONSUL_SERVICE_<port>_POD_IP` | 按端口覆盖 POD_IP 设置 | `true` |
+| `CONSUL_SERVICE_<port>_NAME` | 声明并命名一个额外的容器端口服务 | 同上 |
+| `CONSUL_SERVICE_<port>_TAGS` | 为已声明的容器端口设置标签 | 同上 |
+| `CONSUL_SERVICE_<port>_POD_IP` | 为已声明的容器端口覆盖 POD_IP 设置 | 继承 `CONSUL_SERVICE_POD_IP` |
 
-### 端口检测优先级
+### 端口选择
 
-1. `CONSUL_SERVICE_PORT` 环境变量 / label
-2. Docker 端口映射（`HostPort`）
-3. `NetworkSettings.Ports` keys（捕获 compose `expose:` 等 Docker 已知端口）
-4. Dockerfile 中的 `EXPOSE` 指令
-5. `CONSUL_SERVICE_<port>_*` labels / 环境变量（per-port labels 隐式声明端口）
+最终注册的服务端口由两部分组成：
 
-无法检测到任何端口的容器将被**跳过**（不注册）。对于没有显式端口声明的 docker-compose 服务，可在 compose 文件中添加 `expose:`、在 Dockerfile 中添加 `EXPOSE`，或直接使用 per-port labels（如 `CONSUL_SERVICE_8080_NAME=myapp`）声明端口。
+1. 显式 `CONSUL_SERVICE_<port>_*` labels / 环境变量。这些配置会直接声明对应容器端口，并始终合并进最终服务集合。
+2. 一个默认端口，按以下优先级选择：
+   1. `CONSUL_SERVICE_PORT` 环境变量 / label
+   2. 最小 Docker 端口映射（`HostPort`）对应的容器端口
+   3. 最小 `NetworkSettings.Ports` key（捕获 compose `expose:` 等 Docker 已知端口）
+   4. 最小 Dockerfile `EXPOSE` 端口
+
+如果显式声明的端口本身存在 HostPort 映射，那么在 `CONSUL_SERVICE_<port>_POD_IP=false` 时，仍会优先使用宿主机映射信息。
+
+没有声明端口且也无法检测出默认端口的容器将被**跳过**（不注册）。对于没有显式端口声明的 docker-compose 服务，可在 compose 文件中添加 `expose:`、在 Dockerfile 中添加 `EXPOSE`，或直接使用 per-port labels（如 `CONSUL_SERVICE_8080_NAME=myapp`）声明端口。
 
 ### 健康检查
 
@@ -136,7 +141,7 @@ docker run -d -p 8080:80 \
 | 非 host + `CONSUL_SERVICE_POD_IP=false` + 有端口映射 | 宿主机 IP | 宿主机端口 |
 | 非 host + `CONSUL_SERVICE_POD_IP=false` + 仅 EXPOSE | 容器 IP | 容器端口 |
 
-宿主机 IP 检测优先级：`ADVERTISE_ADDR` 环境变量 > `getaddrinfo(hostname)` > UDP 探测出口 IP。
+宿主机 IP 检测优先级：`ADVERTISE_ADDR` 环境变量 > `getaddrinfo(hostname)` > UDP 探测出口 IP > hostname 字符串回退。
 
 ## Registrator 自身配置
 
@@ -146,6 +151,7 @@ Registrator 容器的环境变量：
 |------|------|--------|
 | `REGISTRATOR_TOKEN` | Consul ACL token | _（无）_ |
 | `CONSUL_ADDR` | Consul HTTP 地址 | `http://localhost:8500` |
+| `DOCKER_SOCK` | Docker Engine socket 路径 | `/var/run/docker.sock` |
 | `RESYNC_INTERVAL` | 全量同步间隔（秒） | `30` |
 | `ADVERTISE_ADDR` | 覆盖自动检测的宿主机 IP | 自动检测 |
 | `HOSTNAME_OVERRIDE` | 覆盖系统主机名（用于 service ID） | 系统主机名 |
@@ -213,13 +219,13 @@ register_container(container_id)
  │
  ├─ 门控: CONSUL_LISTEN_ENABLE != "true" → 跳过 (return 0)
  │
- ├─ detect_ports() 端口检测
- │    ├─ 1. CONSUL_SERVICE_PORT → 反查 HostPort 映射
- │    ├─ 2. NetworkSettings.Ports 中的 HostPort 绑定（去重）
- │    ├─ 3. NetworkSettings.Ports keys（expose: 等 Docker 已知端口）
- │    ├─ 4. Config.ExposedPorts (EXPOSE)
- │    ├─ 5. CONSUL_SERVICE_<port>_* labels / 环境变量（隐式声明端口）
- │    └─ 6. 无端口 → port_count=0，跳过注册
+ ├─ collect_declared_ports() + detect_default_port()
+ │    ├─ 显式 CONSUL_SERVICE_<port>_* labels / 环境变量 → 始终合并
+ │    ├─ 默认端口: CONSUL_SERVICE_PORT → 反查 HostPort 映射
+ │    ├─ 默认端口: 最小 NetworkSettings.Ports HostPort 绑定
+ │    ├─ 默认端口: 最小 NetworkSettings.Ports key
+ │    ├─ 默认端口: 最小 Config.ExposedPorts (EXPOSE)
+ │    └─ 没有声明端口且没有默认端口 → port_count=0，跳过注册
  │
  ├─ 门控: port_count == 0 → 跳过 (return 1，仍计入 enabled)
  │

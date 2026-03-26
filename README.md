@@ -10,11 +10,11 @@ Built on Alpine Linux with libcurl and cJSON. Single binary, minimal footprint.
 
 - **Opt-in mode** — only containers with `CONSUL_LISTEN_ENABLE=true` are registered
 - **Dual-channel config** — reads from container environment variables first, then labels
-- **Auto port detection** — `CONSUL_SERVICE_PORT` > HostPort mapping > `expose:` > EXPOSE > per-port labels; containers with no detectable port are skipped
+- **Auto default port selection** — `CONSUL_SERVICE_PORT` > smallest HostPort-mapped container port > smallest Docker-known port > smallest EXPOSE port
 - **TCP health check** — auto-generates a Consul TCP check targeting `container_ip:container_port`
 - **Smart address resolution** — uses host IP for port-mapped containers, container IP for bridge/custom networks
 - **POD_IP mode** — force registration with container IP + internal port (global or per-port)
-- **Per-port service config** — register multiple services per container with `CONSUL_SERVICE_<port>_NAME`
+- **Per-port service config** — explicitly declared `CONSUL_SERVICE_<port>_*` ports are always merged with the default port
 - **Change-only logging** — resync only logs on state changes, reducing noise
 - **Periodic resync** — full sync on interval to catch missed events and clean orphans
 - **Three-thread architecture** — event stream + event processor + resync, no blocking
@@ -104,19 +104,24 @@ Set via container environment variables (`-e`) or labels (`-l`). Environment var
 | `CONSUL_SERVICE_PORT` | Override auto-detected port (internal/container port) | Auto-detect |
 | `CONSUL_SERVICE_CHECK_INTERVAL` | TCP health check interval | `10s` |
 | `CONSUL_SERVICE_POD_IP` | Set to `false` to use host IP + host port for port-mapped containers | `true` |
-| `CONSUL_SERVICE_<port>_NAME` | Service name for a specific port | Same as above |
-| `CONSUL_SERVICE_<port>_TAGS` | Tags for a specific port | Same as above |
-| `CONSUL_SERVICE_<port>_POD_IP` | Per-port POD_IP override | `true` |
+| `CONSUL_SERVICE_<port>_NAME` | Declare and name an additional service on a specific container port | Same as above |
+| `CONSUL_SERVICE_<port>_TAGS` | Tags for a declared container port | Same as above |
+| `CONSUL_SERVICE_<port>_POD_IP` | Per-port POD_IP override for a declared container port | Inherits `CONSUL_SERVICE_POD_IP` |
 
-### Port Detection Priority
+### Port Selection
 
-1. `CONSUL_SERVICE_PORT` environment variable / label
-2. Docker port mapping (`HostPort`)
-3. `NetworkSettings.Ports` keys (catches compose `expose:` and other Docker-known ports)
-4. `EXPOSE` directive from Dockerfile
-5. `CONSUL_SERVICE_<port>_*` labels / env vars (per-port labels implicitly declare ports)
+Registered services are built from two sources:
 
-Containers with no detectable port are **skipped** (not registered). For docker-compose services without explicit port declarations, you can add `expose:` in the compose file, `EXPOSE` in the Dockerfile, or use per-port labels like `CONSUL_SERVICE_8080_NAME=myapp` to declare ports directly.
+1. Explicit `CONSUL_SERVICE_<port>_*` labels / env vars. These always declare that container port and are always merged into the final service set.
+2. One default port selected by:
+   1. `CONSUL_SERVICE_PORT` environment variable / label
+   2. Smallest Docker port mapping (`HostPort`) container port
+   3. Smallest `NetworkSettings.Ports` key (catches compose `expose:` and other Docker-known ports)
+   4. Smallest `EXPOSE` directive from Dockerfile
+
+If an explicit per-port declaration points at a host-mapped container port, the host mapping is still used when `CONSUL_SERVICE_<port>_POD_IP=false`.
+
+Containers with no declared port and no detectable default port are **skipped** (not registered). For docker-compose services without explicit port declarations, you can add `expose:` in the compose file, `EXPOSE` in the Dockerfile, or use per-port labels like `CONSUL_SERVICE_8080_NAME=myapp` to declare ports directly.
 
 ### Health Check
 
@@ -136,7 +141,7 @@ The service address registered in Consul is determined automatically:
 | Non-host + `CONSUL_SERVICE_POD_IP=false` + port mapping | Host IP | Host port |
 | Non-host + `CONSUL_SERVICE_POD_IP=false` + EXPOSE only | Container IP | Container port |
 
-Host IP detection priority: `ADVERTISE_ADDR` env > `getaddrinfo(hostname)` > outbound IP via UDP probe.
+Host IP detection priority: `ADVERTISE_ADDR` env > `getaddrinfo(hostname)` > outbound IP via UDP probe > hostname string fallback.
 
 ## Registrator Configuration
 
@@ -146,6 +151,7 @@ Environment variables for the registrator container itself:
 |----------|-------------|---------|
 | `REGISTRATOR_TOKEN` | Consul ACL token | _(none)_ |
 | `CONSUL_ADDR` | Consul HTTP address | `http://localhost:8500` |
+| `DOCKER_SOCK` | Docker Engine socket path | `/var/run/docker.sock` |
 | `RESYNC_INTERVAL` | Full sync interval in seconds | `30` |
 | `ADVERTISE_ADDR` | Override auto-detected host IP for Consul registration | Auto-detect |
 | `HOSTNAME_OVERRIDE` | Override system hostname used in service IDs | System hostname |
@@ -213,13 +219,13 @@ register_container(container_id)
  │
  ├─ Gate: CONSUL_LISTEN_ENABLE != "true" → skip (return 0)
  │
- ├─ detect_ports()
- │    ├─ 1. CONSUL_SERVICE_PORT → look up HostPort mapping
- │    ├─ 2. NetworkSettings.Ports HostPort bindings (deduplicated)
- │    ├─ 3. NetworkSettings.Ports keys (expose: / Docker-known ports)
- │    ├─ 4. Config.ExposedPorts (EXPOSE)
- │    ├─ 5. CONSUL_SERVICE_<port>_* labels/env vars (implicit port declaration)
- │    └─ 6. No port found → port_count=0, skip registration
+ ├─ collect_declared_ports() + detect_default_port()
+ │    ├─ Explicit CONSUL_SERVICE_<port>_* labels/env vars → always merged
+ │    ├─ Default port: CONSUL_SERVICE_PORT → look up HostPort mapping
+ │    ├─ Default port: smallest NetworkSettings.Ports HostPort binding
+ │    ├─ Default port: smallest NetworkSettings.Ports key
+ │    ├─ Default port: smallest Config.ExposedPorts entry
+ │    └─ No declared/default port → port_count=0, skip registration
  │
  ├─ Gate: port_count == 0 → skip (return 1, still counts as enabled)
  │
