@@ -5,7 +5,7 @@ local _M = {}
 
 local CONSUL_ADDR
 local CONSUL_TOKEN
-local DOMAIN_SUFFIX
+local DOMAIN_SUFFIXES
 local POLL_INTERVAL
 local FILTER_TAGS
 
@@ -15,8 +15,21 @@ local prev_snapshot = ""
 local function init_config()
     CONSUL_ADDR   = os.getenv("CONSUL_ADDR")   or "http://127.0.0.1:8500"
     CONSUL_TOKEN  = os.getenv("CONSUL_TOKEN")   or ""
-    DOMAIN_SUFFIX = os.getenv("DOMAIN_SUFFIX")  or "svc.local"
     POLL_INTERVAL = tonumber(os.getenv("POLL_INTERVAL")) or 5
+
+    local raw_suffix = os.getenv("DOMAIN_SUFFIX") or "svc.local"
+    DOMAIN_SUFFIXES = {}
+    local seen = {}
+    for suffix in raw_suffix:gmatch("[^,]+") do
+        local s = suffix:match("^%s*(.-)%s*$")
+        if s ~= "" and not seen[s] then
+            seen[s] = true
+            DOMAIN_SUFFIXES[#DOMAIN_SUFFIXES + 1] = s
+        end
+    end
+    if #DOMAIN_SUFFIXES == 0 then
+        DOMAIN_SUFFIXES[1] = "svc.local"
+    end
 
     local raw = os.getenv("FILTER_TAGS") or "web,prometheus"
     FILTER_TAGS = {}
@@ -97,7 +110,7 @@ local function poll_consul(premature)
     end
     prev_names = curr_names
 
-    -- change-only logging: one line per service
+    -- change-only logging: one line per (service, suffix) pair
     local log_lines = {}
     for name, backends in pairs(table_new) do
         local addrs = {}
@@ -105,8 +118,11 @@ local function poll_consul(premature)
             addrs[#addrs + 1] = b.addr .. ":" .. b.port
         end
         table.sort(addrs)
-        log_lines[#log_lines + 1] = name .. "." .. DOMAIN_SUFFIX
-            .. " -> " .. table.concat(addrs, ", ")
+        local joined = table.concat(addrs, ", ")
+        for _, suffix in ipairs(DOMAIN_SUFFIXES) do
+            log_lines[#log_lines + 1] = name .. "." .. suffix
+                .. " -> " .. joined
+        end
     end
     table.sort(log_lines)
     local snapshot = table.concat(log_lines, "\n")
@@ -146,13 +162,15 @@ function _M.route()
 
     host = host:gsub(":%d+$", "")
 
-    local suffix = "." .. DOMAIN_SUFFIX
-    if host:sub(-#suffix) ~= suffix then
-        return ngx.exit(ngx.HTTP_NOT_FOUND)
+    local name
+    for _, suffix in ipairs(DOMAIN_SUFFIXES) do
+        local s = "." .. suffix
+        if #host > #s and host:sub(-#s) == s then
+            name = host:sub(1, #host - #s)
+            break
+        end
     end
-
-    local name = host:sub(1, #host - #suffix)
-    if name == "" then
+    if not name or name == "" then
         return ngx.exit(ngx.HTTP_NOT_FOUND)
     end
 
