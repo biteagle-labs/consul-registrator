@@ -6,6 +6,10 @@ Lightweight Docker service registrator for Consul, written in C. Watches Docker 
 
 Built on Alpine Linux with libcurl and cJSON. Single binary, minimal footprint.
 
+> This repository also ships an optional **OpenResty gateway** (`openresty/`)
+> that consumes what the registrator publishes: a Consul-KV-driven dynamic
+> router with hostname- and path-based routing. See [Gateway (OpenResty)](#gateway-openresty).
+
 ## Features
 
 - **Opt-in mode** — only containers with `CONSUL_LISTEN_ENABLE=true` are registered
@@ -264,6 +268,84 @@ deregister_container(container_id)         cleanup_orphans(valid_ids)
  └─ PUT /v1/agent/service/deregister/{id}   │
                                             └─ PUT /v1/agent/service/deregister/{id}
 ```
+
+## Gateway (OpenResty)
+
+The `openresty/` directory ships an optional OpenResty gateway that turns what
+the registrator publishes into a Consul-driven dynamic router. It polls the
+**local** Consul agent, keeps a routing table in shared memory, and reverse-
+proxies each request to a healthy backend by hostname or path. Routing config
+lives in Consul KV, so domains can be regrouped at runtime without restarting
+the gateway.
+
+### Domain groups (Consul KV)
+
+Config is **per node**: the gateway resolves its Consul node name (from the
+local agent's `GET /v1/agent/self`, or the `NODE_NAME` env override) and reads
+`gateway/<node>/configuration` — a JSON array of groups. Each group binds a set
+of domain suffixes to a set of tags:
+
+```bash
+# <node> is this gateway's Consul node name (e.g. from `consul members`)
+consul kv put gateway/<node>/configuration '[
+  {"name":"web",  "suffixes":["svc.local"],                  "tags":["web","prometheus"]},
+  {"name":"data", "suffixes":["data.local","data.internal"], "tags":["data"]}
+]'
+```
+
+- A service is routable through a group only if it carries one of the group's
+  tags. A service that matches several groups is registered in **each** of them
+  (multi-membership) and reachable through every matching group's suffixes.
+- Config is pulled every `POLL_INTERVAL` seconds. On any KV read failure the
+  last good config is kept; if nothing was ever loaded, every request returns
+  `404`. There is no global default and no env fallback — each node must have
+  its own `gateway/<node>/configuration` key (pure per-node KV).
+
+### Access forms
+
+Every suffix accepts two equivalent request forms:
+
+| Form | Example | Backend receives |
+|------|---------|------------------|
+| Subdomain | `orders.svc.local/api` | `/api` |
+| Path | `svc.local/orders/api` | `/api` (the `/orders` prefix is stripped) |
+
+Both reach service `orders` (as long as `orders` carries a tag of the group
+that owns `svc.local`). The path form is what lets one "main domain" front many
+services, e.g. `node.cen/<service>/...`.
+
+### Gateway configuration
+
+Environment variables for the gateway container (`openresty/docker-compose.yaml`):
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CONSUL_ADDR` | Local Consul agent HTTP address | `http://127.0.0.1:8500` |
+| `CONSUL_TOKEN` | Consul ACL token (needs agent + service + KV read) | _(empty)_ |
+| `POLL_INTERVAL` | KV + service poll interval, seconds | `5` |
+| `NODE_NAME` | Override the Consul node name (else read from agent/self) | _(auto)_ |
+
+The token needs read on the agent (for the node name), the service catalog, and
+the `gateway/` KV prefix — a ready-to-apply policy is in
+[`consul/gateway-policy.hcl`](consul/gateway-policy.hcl).
+
+### Node scope (important)
+
+**The gateway is node-local.** It discovers services with the local agent's
+`GET /v1/agent/services`, which only returns services registered on **the same
+Consul node the gateway runs on** — the containers this node's registrator
+registered. It sees nothing on other nodes and does no per-node pinning.
+
+- To route a node's services, run a gateway **on that node** (co-located with
+  its registrator and agent). For a cluster, deploy one gateway per node.
+- `node.cen` is a **literal** suffix you configure, **not** a Consul node name.
+  Per-node addressing (`<service>.<node>.cen`) is **not** supported; it would
+  require catalog/health discovery instead of the agent-local view.
+- Prometheus `consul_sd` discovers targets **cluster-wide** (catalog) while the
+  gateway is node-local. A target `<service>.cen` that resolves to a gateway not
+  on the service's node will `404`. Keep `*.cen` DNS pointing at a gateway
+  co-located with the services it must reach (single-node, or per-node gateways
+  with node-scoped DNS).
 
 ## License
 

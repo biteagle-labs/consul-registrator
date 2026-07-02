@@ -1,16 +1,18 @@
 # Consul auto-discovery -> OpenResty gateway -> /metrics
 #
-# Domain scheme:
-#   <service>.<node>.cen    per-node pinned scrape (preferred)
-#   <service>.cen           load-balanced across all nodes
+# Domain scheme (gateway reads group config from Consul KV 'gateway/domain_groups'):
+#   <service>.cen           subdomain form, load-balanced across instances
+#   cen/<service>/...       path form (same suffix), prefix stripped before proxy
+#   Note: per-node pinned scrape (<service>.<node>.cen) is NOT supported today.
 #
 # Prerequisites:
 #   1. DNS: all *.cen -> gateway IP (see below)
-#   2. Services registered in Consul with tag 'prometheus'
+#   2. Services tagged 'prometheus' in Consul, and a KV group whose suffix
+#      set includes 'cen' carries that tag
 #   3. Services expose /metrics (or custom path via Meta.metrics_path)
 #
 # DNS resolution (dnsmasq):
-#   address=/cen/10.0.0.1        # all *.cen -> gateway IP
+#   address=/cen/<gateway-ip>    # all *.cen -> gateway IP
 #
 #   If you also need <node>.cen -> node IP (for SSH etc.):
 #   CoreDNS with hosts plugin for exact node records + template fallback,
@@ -37,7 +39,7 @@ scrape_configs:
         # allow_stale: true
 
     relabel_configs:
-      # target: <service>.<node>.cen:80 (per-node, through gateway)
+      # target: <service>.cen:80 (load-balanced across instances, through gateway)
       - source_labels: [__meta_consul_service, __meta_consul_node]
         separator: '.'
         replacement: '${1}.cen:80'

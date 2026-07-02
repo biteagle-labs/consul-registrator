@@ -8,11 +8,10 @@ services:
       - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./lua:/usr/local/openresty/nginx/lua:ro
     environment:
-      - DOMAIN_SUFFIX=${DOMAIN_SUFFIX:-svc.local}
       - CONSUL_ADDR=${CONSUL_ADDR:-http://127.0.0.1:8500}
       - CONSUL_TOKEN=${CONSUL_TOKEN:-}
       - POLL_INTERVAL=${POLL_INTERVAL:-5}
-      - FILTER_TAGS=${FILTER_TAGS:-web,prometheus}
+      - NODE_NAME=${NODE_NAME:-}
     logging:
       driver: json-file
       options:

@@ -6,6 +6,10 @@
 
 基于 Alpine Linux + libcurl + cJSON 构建，单二进制文件，极小资源占用。
 
+> 本仓库还附带一个可选的 **OpenResty 网关**（`openresty/`），消费注册器发布的
+> 服务：一个由 Consul KV 驱动的动态路由器，支持子域名与路径两种路由形态。
+> 参见 [网关（OpenResty）](#网关openresty)。
+
 ## 特性
 
 - **Opt-in 模式** — 仅设置了 `CONSUL_LISTEN_ENABLE=true` 的容器才会被注册
@@ -264,6 +268,76 @@ deregister_container(container_id)         cleanup_orphans(valid_ids)
  └─ PUT /v1/agent/service/deregister/{id}   │
                                             └─ PUT /v1/agent/service/deregister/{id}
 ```
+
+## 网关（OpenResty）
+
+`openresty/` 目录附带一个可选的 OpenResty 网关，把注册器发布的服务变成一个由
+Consul 驱动的动态路由器。它轮询**本地** Consul agent，将路由表保存在共享内存中，
+并按主机名或路径把每个请求反向代理到健康的后端。路由配置存放在 Consul KV 中，
+因此可以在运行时重新分组域名，无需重启网关。
+
+### 域名分组（Consul KV）
+
+配置是**按节点**的：网关先解析自己的 Consul 节点名（来自本地 agent 的
+`GET /v1/agent/self`，或用 `NODE_NAME` 环境变量覆盖），再读取
+`gateway/<node>/configuration`——一个 JSON 数组。每个分组把一组域名后缀绑定到
+一组标签：
+
+```bash
+# <node> 是本网关的 Consul 节点名（例如通过 `consul members` 查看）
+consul kv put gateway/<node>/configuration '[
+  {"name":"web",  "suffixes":["svc.local"],                  "tags":["web","prometheus"]},
+  {"name":"data", "suffixes":["data.local","data.internal"], "tags":["data"]}
+]'
+```
+
+- 服务只有携带某个分组的标签之一，才能通过该分组路由。命中多个分组的服务会在
+  **每个**分组里都注册（多归属），并可通过每个命中分组的后缀访问。
+- 配置每 `POLL_INTERVAL` 秒拉取一次。KV 读取失败时保留上一次成功的配置；若从未
+  成功加载过，则所有请求返回 `404`。没有全局默认、也没有环境变量兜底——每个节点
+  必须有自己的 `gateway/<node>/configuration` 键（纯 per-node KV）。
+
+### 访问形态
+
+每个后缀都接受两种等价的请求形态：
+
+| 形态 | 示例 | 后端收到 |
+|------|------|----------|
+| 子域名 | `orders.svc.local/api` | `/api` |
+| 路径 | `svc.local/orders/api` | `/api`（`/orders` 前缀被剥掉） |
+
+两者都会到达服务 `orders`（前提是 `orders` 携带了拥有 `svc.local` 的分组的标签）。
+路径形态正是让一个“主域名”承载多个服务的方式，例如 `node.cen/<service>/...`。
+
+### 网关配置
+
+网关容器的环境变量（`openresty/docker-compose.yaml`）：
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `CONSUL_ADDR` | 本地 Consul agent HTTP 地址 | `http://127.0.0.1:8500` |
+| `CONSUL_TOKEN` | Consul ACL token（需 agent + service + KV 读权限） | _（空）_ |
+| `POLL_INTERVAL` | KV 与服务的轮询间隔（秒） | `5` |
+| `NODE_NAME` | 覆盖 Consul 节点名（否则从 agent/self 读取） | _（自动）_ |
+
+token 需要对 agent（读节点名）、服务目录、以及 `gateway/` KV 前缀的读权限——可直接
+应用的 policy 见 [`consul/gateway-policy.hcl`](consul/gateway-policy.hcl)。
+
+### 节点范围（重要）
+
+**网关是节点本地的。** 它通过本地 agent 的 `GET /v1/agent/services` 发现服务，
+而该接口只返回**网关所在的同一个 Consul 节点上注册的服务**——也就是本节点的
+注册器所注册的那些容器。它看不到其他节点上的服务，也不做按节点锁定。
+
+- 要路由某个节点的服务，就在**那个节点上**运行一个网关（与它的注册器、agent 同机）。
+  集群场景下，每个节点各部署一个网关。
+- `node.cen` 是你配置的**字面**后缀，**不是** Consul 节点名。按节点寻址
+  （`<service>.<node>.cen`）**不支持**；那需要改用 catalog/health 视图，而非
+  当前的 agent-local 视图。
+- Prometheus `consul_sd` 是**集群级**发现（catalog），而网关是节点本地的。若某个
+  目标 `<service>.cen` 解析到的网关并不在该服务所在的节点上，抓取就会 `404`。
+  请让 `*.cen` DNS 指向与目标服务同机的网关（单节点，或每节点一个网关 + 按节点
+  解析的 DNS）。
 
 ## 许可证
 
